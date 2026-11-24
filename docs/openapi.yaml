@@ -1,0 +1,281 @@
+openapi: 3.1.0
+info:
+  title: Sentinel API
+  version: 0.1.0
+  description: Same-origin API for the single-host Sentinel daemon. Mutations require an authenticated session, Origin validation, and an X-CSRF-Token.
+servers:
+  - url: /api/v1
+security:
+  - sessionCookie: []
+paths:
+  /health:
+    get:
+      security: []
+      summary: Health and collector state
+      responses:
+        "200":
+          description: Daemon health
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  version: { type: string }
+                  timestamp: { type: integer }
+                  collector_started: { type: boolean }
+  /auth/status:
+    get:
+      security: []
+      summary: Check whether first-run setup is required
+      responses:
+        "200": { description: Setup status }
+  /auth/setup:
+    post:
+      security: []
+      summary: Create the administrator account using the one-time bootstrap token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token: { type: string }
+                password: { type: string, minLength: 12, maxLength: 128 }
+      responses:
+        "200": { description: Setup completed and session cookie issued }
+        "401": { description: Token invalid or expired }
+        "409": { description: Administrator already configured }
+  /auth/login:
+    post:
+      security: []
+      summary: Create an administrator session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, maxLength: 64 }
+                password: { type: string, maxLength: 128 }
+      responses:
+        "200": { description: Session cookie and CSRF token }
+        "401": { description: Invalid credentials }
+        "429": { description: Login rate limit reached }
+  /auth/logout:
+    post:
+      summary: Revoke the current session
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      responses:
+        "200": { description: Session revoked }
+        "403": { description: Origin or CSRF check failed }
+  /auth/me:
+    get:
+      summary: Get current session status and CSRF token
+      responses:
+        "200": { description: Authenticated session }
+        "401": { description: Authentication required }
+  /overview:
+    get:
+      summary: Current host, workloads, processes, incidents, and service summary
+      responses:
+        "200": { description: Current overview snapshot }
+  /events:
+    get:
+      summary: Authenticated live update stream
+      responses:
+        "200":
+          description: Server-sent events named update
+          content:
+            text/event-stream:
+              schema: { type: string }
+  /metrics/{name}:
+    get:
+      summary: Historical metric series
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+        - in: query
+          name: minutes
+          schema: { type: integer, minimum: 1, maximum: 525600, default: 360 }
+      responses:
+        "200": { description: Metric samples as timestamp/value pairs }
+        "400": { description: Unknown metric }
+  /processes:
+    get:
+      summary: Search and sort current process inventory
+      parameters:
+        - in: query
+          name: q
+          schema: { type: string, maxLength: 256 }
+        - in: query
+          name: sort
+          schema: { type: string, enum: [cpu, memory, runtime, tree] }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 500 }
+      responses:
+        "200": { description: Process inventory }
+  /processes/{key}:
+    get:
+      summary: Current process record and sampled history
+      parameters:
+        - in: path
+          name: key
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Process detail }
+        "404": { description: No current or historical record }
+  /workloads:
+    get:
+      summary: Current process groups with user labels
+      responses:
+        "200": { description: Workload inventory }
+  /workloads/{workload}/label:
+    put:
+      summary: Save a local workload display name and labels
+      parameters:
+        - in: path
+          name: workload
+          required: true
+          schema: { type: string }
+        - $ref: "#/components/parameters/CsrfToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [display_name]
+              properties:
+                display_name: { type: string }
+                labels:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200": { description: Label saved }
+        "400": { description: Invalid label }
+  /incidents:
+    get:
+      summary: List current or historical incidents
+      parameters:
+        - in: query
+          name: active
+          schema: { type: boolean, default: false }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        "200": { description: Incident list }
+  /incidents/{id}:
+    get:
+      summary: Incident evidence and explanation
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { description: Incident detail }
+        "404": { description: Incident not found }
+  /incidents/{id}/investigate:
+    post:
+      summary: Ask a configured local model to interpret sanitized evidence
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+        - $ref: "#/components/parameters/CsrfToken"
+      responses:
+        "200": { description: AI interpretation and supplied evidence }
+        "503": { description: AI disabled or host pressure guard active }
+  /anomalies:
+    get:
+      summary: List recent anomalies
+      parameters:
+        - in: query
+          name: hours
+          schema: { type: integer, minimum: 1, maximum: 720, default: 24 }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 250 }
+      responses:
+        "200": { description: Anomaly history }
+  /intelligence:
+    get:
+      summary: Read baseline versions, baseline rows, and recent anomalies
+      responses:
+        "200": { description: Intelligence status }
+    delete:
+      summary: Reset learned baselines while preserving measurement and incident history
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      responses:
+        "200": { description: New baseline version and reset timestamp }
+  /services:
+    get:
+      summary: Read-only system and user service inventory
+      responses:
+        "200": { description: Service rows and availability }
+  /config:
+    get:
+      summary: Read public configuration status; secret values are omitted
+      responses:
+        "200": { description: Public configuration }
+    put:
+      summary: Update supported sampling, threshold, and integration enable settings
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                host_seconds: { type: integer }
+                process_seconds: { type: integer }
+                hardware_seconds: { type: integer }
+                service_seconds: { type: integer }
+                retention_hours: { type: integer }
+                notification_enabled: { type: boolean }
+                ai_enabled: { type: boolean }
+                thresholds: { type: object }
+      responses:
+        "200": { description: Updated public configuration }
+        "400": { description: Invalid setting }
+  /notifications:
+    get:
+      summary: Recent notification delivery history
+      responses:
+        "200": { description: Delivery history without endpoint credentials }
+  /notifications/test:
+    post:
+      summary: Send a test to the configured notification provider
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      responses:
+        "200": { description: Test delivered }
+        "400": { description: Notifications disabled or invalid configuration }
+        "502": { description: Provider request failed }
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: sentinel_session
+  parameters:
+    CsrfToken:
+      in: header
+      name: X-CSRF-Token
+      required: true
+      schema: { type: string }
