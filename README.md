@@ -4,7 +4,7 @@ Sentinel is a single-host, local-first Linux monitoring daemon with a private Re
 
 ## Current status
 
-The current Phase II build is installed and running as the unprivileged `sentinel.service` user unit. The listener is verified at `100.64.0.2:8765`; authenticated login, protected APIs, and live SSE work. During a 17m27s post-release observation, Sentinel averaged 0.86% of one CPU core, used 36.7 MiB RSS and 54.3 MiB current cgroup memory (69.9 MiB peak), and ran three tasks without a restart. The database and sidecars totaled 56.7 MiB at the end of the sample. The root filesystem remains under critical storage pressure at 96% used, with 18.15 GiB available; Sentinel did not remove unrelated data. These short samples do not establish long-term performance or storage trends; see [DEPLOYMENT.md](DEPLOYMENT.md) and [RESOURCE_BUDGET.md](RESOURCE_BUDGET.md) for measurement details and limits.
+The current Phase II build is installed and running as the unprivileged `sentinel.service` user unit. The listener is verified at `100.64.0.2:8765`; authenticated login, protected APIs, and live SSE work. During a 28m07s post-release observation, Sentinel averaged 0.85% of one CPU core, used 36.6 MiB RSS and 56.5 MiB current cgroup memory (72.2 MiB peak), and ran three tasks without a restart. The database and sidecars totaled 58.7 MiB at the end of the sample. The root filesystem remains under critical storage pressure at 96% used, with 18.15 GiB available; Sentinel did not remove unrelated data. These short samples do not establish long-term performance or storage trends; see [DEPLOYMENT.md](DEPLOYMENT.md) and [RESOURCE_BUDGET.md](RESOURCE_BUDGET.md) for measurement details and limits.
 
 ## Quick start
 
