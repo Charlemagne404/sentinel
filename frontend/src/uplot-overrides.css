@@ -1,0 +1,4 @@
+.uplot { color: var(--muted); font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.uplot .u-title { color: var(--text); }
+.uplot .u-axis { color: var(--faint); }
+.uplot canvas { max-width: 100%; }

@@ -1,0 +1,1113 @@
+use crate::model::{HostSnapshot, Incident, ProcessSnapshot};
+use anyhow::Context;
+use rusqlite::{Connection, OptionalExtension, backup::Backup, params};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+#[derive(Clone)]
+pub struct Store {
+    path: Arc<PathBuf>,
+    connection: Arc<Mutex<Connection>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Baseline {
+    pub metric: String,
+    pub version: u32,
+    pub samples: usize,
+    pub first_timestamp: i64,
+    pub observed_hours: f64,
+    pub median: Option<f64>,
+    pub mad: Option<f64>,
+    pub ewma: Option<f64>,
+    pub p95: Option<f64>,
+    pub confidence: f64,
+    pub frozen: bool,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NotificationRecord {
+    pub id: i64,
+    pub incident_id: Option<i64>,
+    pub timestamp: i64,
+    pub provider: String,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+impl Store {
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create database directory {}", parent.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        if !path.exists() {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(3))?;
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "wal_autocheckpoint", 1000)?;
+        conn.execute_batch("BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS host_samples(ts INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS metric_points(ts INTEGER NOT NULL, name TEXT NOT NULL, value REAL NOT NULL, PRIMARY KEY(ts,name)) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS metric_points_lookup ON metric_points(name,ts);
+            CREATE TABLE IF NOT EXISTS minute_points(ts INTEGER NOT NULL, name TEXT NOT NULL, value REAL NOT NULL, PRIMARY KEY(ts,name)) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS minute_points_lookup ON minute_points(name,ts);
+            CREATE TABLE IF NOT EXISTS quarter_points(ts INTEGER NOT NULL, name TEXT NOT NULL, value REAL NOT NULL, PRIMARY KEY(ts,name)) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS quarter_points_lookup ON quarter_points(name,ts);
+            CREATE TABLE IF NOT EXISTS process_samples(ts INTEGER NOT NULL, proc_key TEXT NOT NULL, pid INTEGER NOT NULL, ppid INTEGER NOT NULL, uid INTEGER NOT NULL, name TEXT NOT NULL, executable TEXT, state TEXT NOT NULL, start_ticks INTEGER NOT NULL, runtime_seconds INTEGER NOT NULL, cpu_percent REAL NOT NULL, rss_bytes INTEGER NOT NULL, virtual_bytes INTEGER NOT NULL, process_group INTEGER NOT NULL, session INTEGER NOT NULL, cgroup TEXT, workload TEXT NOT NULL, parent_disappeared INTEGER NOT NULL, PRIMARY KEY(ts,proc_key)) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS process_samples_key ON process_samples(proc_key,ts);
+            CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY, signature TEXT NOT NULL, severity TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, recovered_at INTEGER, confidence REAL NOT NULL, evidence TEXT NOT NULL, explanation TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS incidents_status_last ON incidents(status,last_seen DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS active_incident_signature ON incidents(signature) WHERE status='active';
+            CREATE TABLE IF NOT EXISTS anomalies(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, metric TEXT NOT NULL, value REAL NOT NULL, score REAL NOT NULL, reason TEXT NOT NULL, incident_id INTEGER REFERENCES incidents(id));
+            CREATE INDEX IF NOT EXISTS anomalies_ts ON anomalies(ts DESC);
+            CREATE TABLE IF NOT EXISTS baselines(metric TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 1, samples INTEGER NOT NULL, first_ts INTEGER NOT NULL, median REAL, mad REAL, ewma REAL, p95 REAL, confidence REAL NOT NULL, frozen INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS baseline_state(id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, reset_at INTEGER NOT NULL);
+            INSERT OR IGNORE INTO baseline_state(id,version,reset_at) VALUES(1,1,unixepoch());
+            CREATE TABLE IF NOT EXISTS excluded_points(metric TEXT NOT NULL, ts INTEGER NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(metric,ts)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS accounts(username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, csrf TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS bootstrap_tokens(token_hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workload_labels(workload TEXT PRIMARY KEY, display_name TEXT NOT NULL, labels_json TEXT NOT NULL DEFAULT '[]', updated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS notification_history(id INTEGER PRIMARY KEY, incident_id INTEGER, signature TEXT NOT NULL DEFAULT '', ts INTEGER NOT NULL, provider TEXT NOT NULL, status TEXT NOT NULL, detail TEXT);
+            INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,unixepoch());
+            COMMIT;")?;
+        let has_signature: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('notification_history') WHERE name='signature')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_signature {
+            conn.execute(
+                "ALTER TABLE notification_history ADD COLUMN signature TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        let has_baseline_version: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('baselines') WHERE name='version')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_baseline_version {
+            conn.execute(
+                "ALTER TABLE baselines ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+                [],
+            )?;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,unixepoch()),(3,unixepoch())",
+            [],
+        )?;
+        Ok(Self {
+            path: Arc::new(path.to_path_buf()),
+            connection: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    fn lock(&self) -> anyhow::Result<std::sync::MutexGuard<'_, Connection>> {
+        self.connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))
+    }
+    pub fn path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    pub fn insert_snapshot(&self, snapshot: &HostSnapshot) -> anyhow::Result<()> {
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        let payload = serde_json::to_string(snapshot)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO host_samples(ts,payload) VALUES(?1,?2)",
+            params![snapshot.timestamp, payload],
+        )?;
+        let metrics = snapshot.metrics();
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR REPLACE INTO metric_points(ts,name,value) VALUES(?1,?2,?3)",
+            )?;
+            for (name, value) in metrics {
+                if value.is_finite() {
+                    stmt.execute(params![snapshot.timestamp, name, value])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn save_processes(&self, ts: i64, processes: &[ProcessSnapshot]) -> anyhow::Result<()> {
+        let mut selected = Vec::with_capacity(120);
+        let mut by_cpu = processes.iter().collect::<Vec<_>>();
+        by_cpu.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
+        selected.extend(by_cpu.into_iter().take(50));
+        let mut by_memory = processes.iter().collect::<Vec<_>>();
+        by_memory.sort_by_key(|p| std::cmp::Reverse(p.rss_bytes));
+        selected.extend(by_memory.into_iter().take(50));
+        selected.extend(processes.iter().filter(|p| p.parent_disappeared));
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare_cached("INSERT OR REPLACE INTO process_samples(ts,proc_key,pid,ppid,uid,name,executable,state,start_ticks,runtime_seconds,cpu_percent,rss_bytes,virtual_bytes,process_group,session,cgroup,workload,parent_disappeared) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")?;
+        let mut seen = std::collections::HashSet::new();
+        for p in selected {
+            if !seen.insert(p.key.as_str()) {
+                continue;
+            }
+            stmt.execute(params![
+                ts,
+                p.key,
+                p.pid as i64,
+                p.ppid as i64,
+                p.uid as i64,
+                p.name,
+                p.executable,
+                p.state,
+                to_sql_i64(p.start_ticks),
+                to_sql_i64(p.runtime_seconds),
+                p.cpu_percent,
+                to_sql_i64(p.rss_bytes),
+                to_sql_i64(p.virtual_bytes),
+                p.process_group,
+                p.session,
+                p.cgroup,
+                p.workload,
+                p.parent_disappeared as i32
+            ])?;
+        }
+        drop(stmt);
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn latest_snapshot(&self) -> anyhow::Result<Option<HostSnapshot>> {
+        let conn = self.lock()?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM host_samples ORDER BY ts DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        raw.map(|s| serde_json::from_str(&s).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn process_history(
+        &self,
+        key: &str,
+        since: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.lock()?;
+        let mut stmt=conn.prepare("SELECT ts,cpu_percent,rss_bytes,ppid,workload,parent_disappeared FROM process_samples WHERE proc_key=? AND ts>=? ORDER BY ts DESC LIMIT ?")?;
+        let rows=stmt.query_map(params![key,since,limit.clamp(1,2000) as i64],|r| Ok(serde_json::json!({"timestamp":r.get::<_,i64>(0)?,"cpu_percent":r.get::<_,f64>(1)?,"rss_bytes":r.get::<_,i64>(2)? as u64,"ppid":r.get::<_,i64>(3)? as u32,"workload":r.get::<_,String>(4)?,"parent_disappeared":r.get::<_,i32>(5)?!=0})))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn chart(
+        &self,
+        metric: &str,
+        since: i64,
+        max_points: usize,
+    ) -> anyhow::Result<Vec<[f64; 2]>> {
+        if !known_metric(metric) {
+            anyhow::bail!("unknown metric");
+        }
+        let conn = self.lock()?;
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM metric_points WHERE name=? AND ts>=?",
+            params![metric, since],
+            |r| r.get(0),
+        )?;
+        let now = unix_now();
+        let table = if since < now - 30 * 86400 {
+            "quarter_points"
+        } else if since < now - 48 * 3600 || count as usize > max_points {
+            "minute_points"
+        } else {
+            "metric_points"
+        };
+        let group_seconds =
+            if table == "minute_points" && count as usize > max_points.saturating_mul(10) {
+                900
+            } else if table == "minute_points" {
+                60
+            } else {
+                0
+            };
+        let sql = if group_seconds > 0 {
+            format!(
+                "SELECT CAST(ts/{group_seconds} AS INTEGER)*{group_seconds},avg(value) FROM {table} WHERE name=? AND ts>=? GROUP BY 1 ORDER BY 1"
+            )
+        } else {
+            format!("SELECT ts,value FROM {table} WHERE name=? AND ts>=? ORDER BY ts")
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![metric, since], |r| {
+            Ok([r.get::<_, i64>(0)? as f64, r.get::<_, f64>(1)?])
+        })?;
+        let mut values = rows.collect::<Result<Vec<_>, _>>()?;
+        if values.len() > max_points {
+            let stride = (values.len() + max_points - 1) / max_points;
+            values = values.into_iter().step_by(stride).collect();
+        }
+        Ok(values)
+    }
+
+    pub fn baseline_values(
+        &self,
+        metric: &str,
+        since: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<f64>> {
+        if !known_metric(metric) {
+            anyhow::bail!("unknown metric");
+        }
+        let conn = self.lock()?;
+        let mut stmt=conn.prepare("SELECT value FROM minute_points m WHERE name=? AND ts>=? AND NOT EXISTS(SELECT 1 FROM excluded_points e WHERE e.metric=m.name AND e.ts=m.ts) ORDER BY ts DESC LIMIT ?")?;
+        let values = stmt
+            .query_map(params![metric, since, limit.clamp(1, 10000) as i64], |r| {
+                r.get(0)
+            })?
+            .collect::<Result<Vec<f64>, _>>()?;
+        Ok(values.into_iter().rev().collect())
+    }
+
+    pub fn baseline_first_timestamp(
+        &self,
+        metric: &str,
+        since: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        if !known_metric(metric) {
+            anyhow::bail!("unknown metric");
+        }
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT min(m.ts) FROM minute_points m WHERE m.name=? AND m.ts>=? AND NOT EXISTS(SELECT 1 FROM excluded_points e WHERE e.metric=m.name AND e.ts=m.ts)",
+            params![metric, since],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn baseline_state(&self) -> anyhow::Result<(u32, i64)> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT version,reset_at FROM baseline_state WHERE id=1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?.max(1) as u32, row.get(1)?)),
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn reset_baselines(&self, now: i64) -> anyhow::Result<(u32, i64)> {
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM baselines", [])?;
+        tx.execute(
+            "UPDATE baseline_state SET version=version+1,reset_at=?1 WHERE id=1",
+            [now],
+        )?;
+        let state = tx.query_row(
+            "SELECT version,reset_at FROM baseline_state WHERE id=1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?.max(1) as u32, row.get(1)?)),
+        )?;
+        tx.commit()?;
+        Ok(state)
+    }
+
+    pub fn save_baseline(&self, b: &Baseline, first_ts: i64) -> anyhow::Result<()> {
+        self.lock()?.execute("INSERT INTO baselines(metric,version,samples,first_ts,median,mad,ewma,p95,confidence,frozen,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(metric) DO UPDATE SET version=excluded.version,samples=excluded.samples,first_ts=excluded.first_ts,median=excluded.median,mad=excluded.mad,ewma=excluded.ewma,p95=excluded.p95,confidence=excluded.confidence,frozen=excluded.frozen,updated_at=excluded.updated_at",params![b.metric,b.version as i64,b.samples as i64,first_ts,b.median,b.mad,b.ewma,b.p95,b.confidence,b.frozen as i32,b.updated_at])?;
+        Ok(())
+    }
+
+    pub fn baselines(&self) -> anyhow::Result<Vec<Baseline>> {
+        let conn = self.lock()?;
+        let mut stmt=conn.prepare("SELECT metric,version,samples,first_ts,median,mad,ewma,p95,confidence,frozen,updated_at FROM baselines ORDER BY metric")?;
+        let now = unix_now();
+        let rows = stmt.query_map([], |r| {
+            let first: i64 = r.get(3)?;
+            Ok(Baseline {
+                metric: r.get(0)?,
+                version: r.get::<_, i64>(1)?.max(1) as u32,
+                samples: r.get::<_, i64>(2)? as usize,
+                first_timestamp: first,
+                observed_hours: ((now - first).max(0) as f64) / 3600.0,
+                median: r.get(4)?,
+                mad: r.get(5)?,
+                ewma: r.get(6)?,
+                p95: r.get(7)?,
+                confidence: r.get(8)?,
+                frozen: r.get::<_, i32>(9)? != 0,
+                updated_at: r.get(10)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn append_anomaly(
+        &self,
+        ts: i64,
+        metric: &str,
+        value: f64,
+        score: f64,
+        reason: &str,
+        incident_id: Option<i64>,
+    ) -> anyhow::Result<()> {
+        self.lock()?.execute(
+            "INSERT INTO anomalies(ts,metric,value,score,reason,incident_id) VALUES(?,?,?,?,?,?)",
+            params![ts, metric, value, score, reason, incident_id],
+        )?;
+        Ok(())
+    }
+    pub fn exclude_baseline_point(
+        &self,
+        metric: &str,
+        ts: i64,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        self.lock()?.execute(
+            "INSERT OR IGNORE INTO excluded_points(metric,ts,reason) VALUES(?,?,?)",
+            params![metric, ts, reason],
+        )?;
+        Ok(())
+    }
+
+    pub fn open_or_update_incident(
+        &self,
+        signature: &str,
+        severity: &str,
+        title: &str,
+        confidence: f64,
+        evidence: &serde_json::Value,
+        explanation: &str,
+        now: i64,
+    ) -> anyhow::Result<(i64, bool)> {
+        let conn = self.lock()?;
+        let encoded = serde_json::to_string(evidence)?;
+        if let Some(id) = conn
+            .query_row(
+                "SELECT id FROM incidents WHERE signature=? AND status='active'",
+                [signature],
+                |r| r.get(0),
+            )
+            .optional()?
+        {
+            conn.execute("UPDATE incidents SET severity=?2,title=?3,last_seen=?4,confidence=max(confidence,?5),evidence=?6,explanation=?7 WHERE id=?1",params![id,severity,title,now,confidence,encoded,explanation])?;
+            Ok((id, false))
+        } else {
+            conn.execute("INSERT INTO incidents(signature,severity,title,status,first_seen,last_seen,confidence,evidence,explanation) VALUES(?,?,?,'active',?,?,?,?,?)",params![signature,severity,title,now,now,confidence,encoded,explanation])?;
+            Ok((conn.last_insert_rowid(), true))
+        }
+    }
+
+    pub fn recover_incident(&self, signature: &str, now: i64) -> anyhow::Result<bool> {
+        Ok(self.lock()?.execute("UPDATE incidents SET status='recovered',recovered_at=?2,last_seen=?2 WHERE signature=?1 AND status='active'",params![signature,now])? > 0)
+    }
+
+    pub fn incidents(&self, active_only: bool, limit: usize) -> anyhow::Result<Vec<Incident>> {
+        let conn = self.lock()?;
+        let sql = if active_only {
+            "SELECT id,signature,severity,title,status,first_seen,last_seen,recovered_at,confidence,evidence,explanation FROM incidents WHERE status='active' ORDER BY last_seen DESC LIMIT ?"
+        } else {
+            "SELECT id,signature,severity,title,status,first_seen,last_seen,recovered_at,confidence,evidence,explanation FROM incidents ORDER BY last_seen DESC LIMIT ?"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([limit.clamp(1, 500) as i64], |r| {
+            let raw: String = r.get(9)?;
+            Ok(Incident {
+                id: r.get(0)?,
+                signature: r.get(1)?,
+                severity: r.get(2)?,
+                title: r.get(3)?,
+                status: r.get(4)?,
+                first_seen: r.get(5)?,
+                last_seen: r.get(6)?,
+                recovered_at: r.get(7)?,
+                confidence: r.get(8)?,
+                evidence: serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
+                explanation: r.get(10)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn log_notification(
+        &self,
+        incident_id: Option<i64>,
+        signature: &str,
+        timestamp: i64,
+        provider: &str,
+        status: &str,
+        detail: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.lock()?.execute(
+            "INSERT INTO notification_history(incident_id,signature,ts,provider,status,detail) VALUES(?,?,?,?,?,?)",
+            params![incident_id, signature, timestamp, provider, status, detail],
+        )?;
+        Ok(())
+    }
+
+    pub fn notifications(&self, limit: usize) -> anyhow::Result<Vec<NotificationRecord>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT id,incident_id,ts,provider,status,detail FROM notification_history ORDER BY ts DESC,id DESC LIMIT ?",
+        )?;
+        let rows = statement.query_map([limit.clamp(1, 250) as i64], |row| {
+            Ok(NotificationRecord {
+                id: row.get(0)?,
+                incident_id: row.get(1)?,
+                timestamp: row.get(2)?,
+                provider: row.get(3)?,
+                status: row.get(4)?,
+                detail: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn last_notification_at(&self, signature: &str) -> anyhow::Result<Option<i64>> {
+        self.lock()?
+            .query_row(
+                "SELECT max(ts) FROM notification_history WHERE signature=? AND status='sent'",
+                [signature],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn anomalies(&self, since: i64, limit: usize) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.lock()?;
+        let mut stmt=conn.prepare("SELECT ts,metric,value,score,reason,incident_id FROM anomalies WHERE ts>=? ORDER BY ts DESC LIMIT ?")?;
+        let rows=stmt.query_map(params![since,limit.clamp(1,1000) as i64],|r|Ok(serde_json::json!({"timestamp":r.get::<_,i64>(0)?,"metric":r.get::<_,String>(1)?,"value":r.get::<_,f64>(2)?,"score":r.get::<_,f64>(3)?,"reason":r.get::<_,String>(4)?,"incident_id":r.get::<_,Option<i64>>(5)?})))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn aggregate_until(&self, now: i64) -> anyhow::Result<()> {
+        let bucket = now.div_euclid(60) * 60;
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("INSERT OR REPLACE INTO minute_points(ts,name,value) SELECT CAST(ts/60 AS INTEGER)*60,name,avg(value) FROM metric_points WHERE ts>=? AND ts<? GROUP BY CAST(ts/60 AS INTEGER),name",params![bucket-60,bucket])?;
+        if bucket.rem_euclid(900) == 0 {
+            tx.execute("INSERT OR REPLACE INTO quarter_points(ts,name,value) SELECT CAST(ts/900 AS INTEGER)*900,name,avg(value) FROM minute_points WHERE ts>=? AND ts<? GROUP BY CAST(ts/900 AS INTEGER),name",params![bucket-900,bucket])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn cleanup(&self, now: i64, raw_hours: u64, budget_mb: u64) -> anyhow::Result<u64> {
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM host_samples WHERE ts<?",
+            [now - (raw_hours as i64 * 3600)],
+        )?;
+        tx.execute(
+            "DELETE FROM metric_points WHERE ts<?",
+            [now - (raw_hours as i64 * 3600)],
+        )?;
+        tx.execute(
+            "DELETE FROM process_samples WHERE ts<?",
+            [now - (raw_hours as i64 * 3600)],
+        )?;
+        tx.execute("DELETE FROM minute_points WHERE ts<?", [now - 30 * 86400])?;
+        tx.execute("DELETE FROM quarter_points WHERE ts<?", [now - 365 * 86400])?;
+        tx.execute(
+            "DELETE FROM incidents WHERE status='recovered' AND recovered_at<?",
+            [now - 365 * 86400],
+        )?;
+        tx.execute("DELETE FROM anomalies WHERE ts<?", [now - 30 * 86400])?;
+        tx.execute("DELETE FROM excluded_points WHERE ts<?", [now - 30 * 86400])?;
+        tx.execute(
+            "DELETE FROM notification_history WHERE ts<?",
+            [now - 365 * 86400],
+        )?;
+        tx.execute("DELETE FROM sessions WHERE expires_at<?", [now])?;
+        tx.commit()?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
+        let mut bytes = self.database_size_bytes();
+        let budget = budget_mb * 1024 * 1024;
+        if bytes > budget {
+            conn.execute(
+                "DELETE FROM process_samples WHERE ts<?",
+                [now - (raw_hours.min(12) as i64 * 3600)],
+            )?;
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            conn.execute_batch("PRAGMA incremental_vacuum(2048)")?;
+            bytes = self.database_size_bytes();
+        }
+        if bytes > budget {
+            let raw_cutoff = now - (raw_hours.min(6) as i64 * 3600);
+            conn.execute("DELETE FROM process_samples WHERE ts<?", [raw_cutoff])?;
+            conn.execute("DELETE FROM host_samples WHERE ts<?", [raw_cutoff])?;
+            conn.execute("DELETE FROM metric_points WHERE ts<?", [raw_cutoff])?;
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            conn.execute_batch("PRAGMA incremental_vacuum(4096)")?;
+            bytes = self.database_size_bytes();
+        }
+        if bytes > budget {
+            conn.execute("DELETE FROM minute_points WHERE ts<?", [now - 14 * 86400])?;
+            conn.execute("DELETE FROM quarter_points WHERE ts<?", [now - 180 * 86400])?;
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            conn.execute_batch("PRAGMA incremental_vacuum(8192)")?;
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
+        conn.execute_batch("PRAGMA incremental_vacuum(512)")?;
+        Ok(self.database_size_bytes())
+    }
+
+    pub fn integrity_check(&self) -> anyhow::Result<String> {
+        Ok(self
+            .lock()?
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))?)
+    }
+    pub fn count(&self, table: &str) -> anyhow::Result<i64> {
+        let sql = match table {
+            "host_samples" => "SELECT count(*) FROM host_samples",
+            "incidents" => "SELECT count(*) FROM incidents",
+            "process_samples" => "SELECT count(*) FROM process_samples",
+            _ => anyhow::bail!("unsupported table"),
+        };
+        Ok(self.lock()?.query_row(sql, [], |r| r.get(0))?)
+    }
+    pub fn database_size_bytes(&self) -> u64 {
+        let mut size = std::fs::metadata(self.path()).map(|m| m.len()).unwrap_or(0);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = self.path().as_os_str().to_os_string();
+            sidecar.push(suffix);
+            size = size.saturating_add(
+                std::fs::metadata(PathBuf::from(sidecar))
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0),
+            );
+        }
+        size
+    }
+
+    pub fn account_hash(&self, username: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .lock()?
+            .query_row(
+                "SELECT password_hash FROM accounts WHERE username=?",
+                [username],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    pub fn has_account(&self) -> anyhow::Result<bool> {
+        Ok(self
+            .lock()?
+            .query_row("SELECT EXISTS(SELECT 1 FROM accounts)", [], |r| {
+                r.get::<_, i32>(0)
+            })?
+            != 0)
+    }
+    pub fn register_bootstrap_token(&self, token_hash: &str, now: i64) -> anyhow::Result<()> {
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM bootstrap_tokens WHERE created_at<?",
+            [now - 1800],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO bootstrap_tokens(token_hash,created_at) VALUES(?,?)",
+            params![token_hash, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn bootstrap_token_valid(&self, token_hash: &str, now: i64) -> anyhow::Result<bool> {
+        Ok(self.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bootstrap_tokens WHERE token_hash=? AND created_at>=?)",
+            params![token_hash, now - 1800],
+            |r| r.get::<_, i32>(0),
+        )? != 0)
+    }
+    pub fn create_admin_once(
+        &self,
+        token_hash: &str,
+        password_hash: &str,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let valid: i32 = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bootstrap_tokens WHERE token_hash=? AND created_at>=?)",
+            params![token_hash, now - 1800],
+            |r| r.get(0),
+        )?;
+        let has_user: i32 =
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM accounts)", [], |r| r.get(0))?;
+        if valid == 0 || has_user != 0 {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO accounts(username,password_hash,created_at) VALUES('admin',?,?)",
+            params![password_hash, now],
+        )?;
+        tx.execute("DELETE FROM bootstrap_tokens", [])?;
+        tx.commit()?;
+        Ok(true)
+    }
+    pub fn create_session(
+        &self,
+        token_hash: &str,
+        csrf: &str,
+        created: i64,
+        expires: i64,
+    ) -> anyhow::Result<()> {
+        self.lock()?.execute(
+            "INSERT INTO sessions(token_hash,csrf,created_at,expires_at) VALUES(?,?,?,?)",
+            params![token_hash, csrf, created, expires],
+        )?;
+        Ok(())
+    }
+    pub fn session(&self, token_hash: &str, now: i64) -> anyhow::Result<Option<(String, i64)>> {
+        Ok(self
+            .lock()?
+            .query_row(
+                "SELECT csrf,expires_at FROM sessions WHERE token_hash=? AND expires_at>?",
+                params![token_hash, now],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+    pub fn delete_session(&self, token_hash: &str) -> anyhow::Result<()> {
+        self.lock()?
+            .execute("DELETE FROM sessions WHERE token_hash=?", [token_hash])?;
+        Ok(())
+    }
+    pub fn reset_admin_account(&self) -> anyhow::Result<()> {
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM sessions", [])?;
+        tx.execute("DELETE FROM accounts", [])?;
+        tx.execute("DELETE FROM bootstrap_tokens", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn save_workload_label(
+        &self,
+        workload: &str,
+        display_name: &str,
+        labels: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let encoded = serde_json::to_string(
+            &labels
+                .into_iter()
+                .filter(|s| s.len() <= 64)
+                .take(20)
+                .collect::<Vec<_>>(),
+        )?;
+        self.lock()?.execute("INSERT INTO workload_labels(workload,display_name,labels_json,updated_at) VALUES(?,?,?,?) ON CONFLICT(workload) DO UPDATE SET display_name=excluded.display_name,labels_json=excluded.labels_json,updated_at=excluded.updated_at",params![workload,display_name,encoded,unix_now()])?;
+        Ok(())
+    }
+    pub fn workload_labels(&self) -> anyhow::Result<HashMap<String, (String, Vec<String>)>> {
+        let conn = self.lock()?;
+        let mut stmt =
+            conn.prepare("SELECT workload,display_name,labels_json FROM workload_labels")?;
+        let rows = stmt.query_map([], |r| {
+            let labels: String = r.get(2)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                (
+                    r.get::<_, String>(1)?,
+                    serde_json::from_str(&labels).unwrap_or_default(),
+                ),
+            ))
+        })?;
+        Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+    }
+    pub fn backup(&self, destination: &Path) -> anyhow::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if destination.exists() {
+            anyhow::bail!(
+                "backup destination already exists: {}",
+                destination.display()
+            );
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut temp = destination.as_os_str().to_os_string();
+        temp.push(".tmp");
+        let temp = PathBuf::from(temp);
+        let temp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        drop(temp_file);
+        let source = self.lock()?;
+        let mut target = Connection::open(&temp)?;
+        let backup = Backup::new(&source, &mut target)?;
+        backup.run_to_completion(64, std::time::Duration::from_millis(20), None)?;
+        drop(backup);
+        drop(target);
+        drop(source);
+        std::fs::rename(&temp, destination)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+}
+fn to_sql_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+impl HostSnapshot {
+    pub fn metrics(&self) -> Vec<(String, f64)> {
+        let mut v = vec![
+            ("cpu".into(), self.cpu_percent),
+            ("cpu_user_percent".into(), self.cpu_user_percent),
+            ("cpu_system_percent".into(), self.cpu_system_percent),
+            ("cpu_iowait_percent".into(), self.cpu_iowait_percent),
+            (
+                "cpu_idle_percent".into(),
+                (100.0 - self.cpu_percent).max(0.0),
+            ),
+            (
+                "memory_used_percent".into(),
+                if self.memory_total_bytes > 0 {
+                    self.memory_used_bytes as f64 * 100.0 / self.memory_total_bytes as f64
+                } else {
+                    0.0
+                },
+            ),
+            (
+                "memory_available_percent".into(),
+                if self.memory_total_bytes > 0 {
+                    self.memory_available_bytes as f64 * 100.0 / self.memory_total_bytes as f64
+                } else {
+                    0.0
+                },
+            ),
+            (
+                "swap_used_percent".into(),
+                if self.swap_total_bytes > 0 {
+                    (self.swap_total_bytes.saturating_sub(self.swap_free_bytes)) as f64 * 100.0
+                        / self.swap_total_bytes as f64
+                } else {
+                    0.0
+                },
+            ),
+            ("swap_in_bytes_per_sec".into(), self.swap_in_bytes_per_sec),
+            ("swap_out_bytes_per_sec".into(), self.swap_out_bytes_per_sec),
+            ("load_1m".into(), self.load[0]),
+            ("load_5m".into(), self.load[1]),
+            ("load_15m".into(), self.load[2]),
+            (
+                "cpu_pressure".into(),
+                self.psi_cpu_some_percent.unwrap_or(0.0),
+            ),
+            (
+                "memory_pressure".into(),
+                self.psi_memory_some_percent.unwrap_or(0.0),
+            ),
+            (
+                "memory_full_pressure".into(),
+                self.psi_memory_full_percent.unwrap_or(0.0),
+            ),
+            (
+                "io_pressure".into(),
+                self.psi_io_some_percent.unwrap_or(0.0),
+            ),
+            (
+                "disk_used_percent".into(),
+                if self.disk_total_bytes > 0 {
+                    (self
+                        .disk_total_bytes
+                        .saturating_sub(self.disk_available_bytes)) as f64
+                        * 100.0
+                        / self.disk_total_bytes as f64
+                } else {
+                    0.0
+                },
+            ),
+            (
+                "disk_read_bytes_per_sec".into(),
+                self.disk_read_bytes_per_sec,
+            ),
+            (
+                "disk_write_bytes_per_sec".into(),
+                self.disk_write_bytes_per_sec,
+            ),
+            ("disk_read_iops".into(), self.disk_read_iops),
+            ("disk_write_iops".into(), self.disk_write_iops),
+            (
+                "network_rx_bytes_per_sec".into(),
+                self.network_rx_bytes_per_sec,
+            ),
+            (
+                "network_tx_bytes_per_sec".into(),
+                self.network_tx_bytes_per_sec,
+            ),
+        ];
+        for (index, value) in self.per_core.iter().copied().enumerate() {
+            v.push((format!("cpu_core_{index}"), value));
+        }
+        if let Some(t) = self.cpu_temperature_c {
+            v.push(("cpu_temperature_c".into(), t));
+        }
+        if let Some(g) = &self.gpu {
+            if let Some(x) = g.utilization_percent {
+                v.push(("gpu_utilization_percent".into(), x));
+            }
+            if let (Some(used), Some(total)) = (g.memory_used_bytes, g.memory_total_bytes) {
+                if total > 0 {
+                    v.push((
+                        "gpu_memory_used_percent".into(),
+                        used as f64 * 100.0 / total as f64,
+                    ));
+                }
+            }
+            if let Some(x) = g.temperature_c {
+                v.push(("gpu_temperature_c".into(), x));
+            }
+            if let Some(x) = g.power_watts {
+                v.push(("gpu_power_watts".into(), x));
+            }
+        }
+        v
+    }
+}
+fn known_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "cpu"
+            | "cpu_user_percent"
+            | "cpu_system_percent"
+            | "cpu_iowait_percent"
+            | "cpu_idle_percent"
+            | "memory_used_percent"
+            | "memory_available_percent"
+            | "swap_used_percent"
+            | "swap_in_bytes_per_sec"
+            | "swap_out_bytes_per_sec"
+            | "load_1m"
+            | "load_5m"
+            | "load_15m"
+            | "cpu_pressure"
+            | "memory_pressure"
+            | "memory_full_pressure"
+            | "io_pressure"
+            | "disk_used_percent"
+            | "disk_read_bytes_per_sec"
+            | "disk_write_bytes_per_sec"
+            | "disk_read_iops"
+            | "disk_write_iops"
+            | "network_rx_bytes_per_sec"
+            | "network_tx_bytes_per_sec"
+            | "cpu_temperature_c"
+            | "gpu_utilization_percent"
+            | "gpu_memory_used_percent"
+            | "gpu_temperature_c"
+            | "gpu_power_watts"
+    ) || name
+        .strip_prefix("cpu_core_")
+        .is_some_and(|index| index.parse::<usize>().is_ok_and(|n| n < 256))
+}
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn migrations_create_database_and_integrity_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("test.sqlite")).unwrap();
+        assert_eq!(s.integrity_check().unwrap(), "ok");
+        assert_eq!(s.count("host_samples").unwrap(), 0);
+        assert_eq!(s.baseline_state().unwrap().0, 1);
+    }
+    #[test]
+    fn migration_adds_notification_signature_and_baseline_version_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE notification_history(id INTEGER PRIMARY KEY, incident_id INTEGER, ts INTEGER NOT NULL, provider TEXT NOT NULL, status TEXT NOT NULL, detail TEXT);
+                 INSERT INTO notification_history(id,ts,provider,status) VALUES(1,100,'ntfy','sent');
+                 CREATE TABLE baselines(metric TEXT PRIMARY KEY, samples INTEGER NOT NULL, first_ts INTEGER NOT NULL, median REAL, mad REAL, ewma REAL, p95 REAL, confidence REAL NOT NULL, frozen INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
+                 INSERT INTO baselines(metric,samples,first_ts,confidence,updated_at) VALUES('cpu',10,60,0.5,100);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let baseline = store.baselines().unwrap().pop().unwrap();
+        assert_eq!(baseline.metric, "cpu");
+        assert_eq!(baseline.version, 1);
+        let conn = store.lock().unwrap();
+        let signature_column: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('notification_history') WHERE name='signature')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(signature_column);
+        let signature: String = conn
+            .query_row(
+                "SELECT signature FROM notification_history WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(signature, "");
+    }
+    #[test]
+    fn baseline_reset_versions_model_without_deleting_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("test.sqlite")).unwrap();
+        {
+            let conn = s.lock().unwrap();
+            conn.execute(
+                "INSERT INTO minute_points(ts,name,value) VALUES(60,'cpu',12.0)",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO anomalies(ts,metric,value,score,reason) VALUES(60,'cpu',12.0,5.0,'test')", []).unwrap();
+            conn.execute("INSERT INTO baselines(metric,version,samples,first_ts,confidence,updated_at) VALUES('cpu',1,1,60,0.1,60)", []).unwrap();
+        }
+        let (version, reset_at) = s.reset_baselines(120).unwrap();
+        assert_eq!((version, reset_at), (2, 120));
+        assert!(s.baselines().unwrap().is_empty());
+        assert_eq!(s.anomalies(0, 10).unwrap().len(), 1);
+        let history_points: i64 = s
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM minute_points", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(history_points, 1);
+    }
+    #[test]
+    fn cleanup_expires_old_notification_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("test.sqlite")).unwrap();
+        let now = 400 * 86400_i64;
+        s.log_notification(None, "old", now - 366 * 86400, "ntfy", "sent", None)
+            .unwrap();
+        s.log_notification(None, "new", now - 10, "ntfy", "sent", None)
+            .unwrap();
+        s.cleanup(now, 48, 500).unwrap();
+        let notifications = s.notifications(10).unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].timestamp, now - 10);
+    }
+    #[test]
+    fn online_backup_is_restorable_and_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Store::open(&dir.path().join("source.sqlite")).unwrap();
+        let mut snapshot = HostSnapshot::default();
+        snapshot.timestamp = unix_now();
+        snapshot.cpu_percent = 17.0;
+        source.insert_snapshot(&snapshot).unwrap();
+        let backup_path = dir.path().join("backup.sqlite");
+        source.backup(&backup_path).unwrap();
+        assert!(source.backup(&backup_path).is_err());
+
+        let restored = Store::open(&backup_path).unwrap();
+        assert_eq!(restored.integrity_check().unwrap(), "ok");
+        assert_eq!(
+            restored.latest_snapshot().unwrap().unwrap().cpu_percent,
+            17.0
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(backup_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+    #[test]
+    fn snapshot_metrics_are_stored_and_charted() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("test.sqlite")).unwrap();
+        let mut h = HostSnapshot::default();
+        h.timestamp = unix_now();
+        h.memory_total_bytes = 100;
+        h.memory_used_bytes = 30;
+        h.memory_available_bytes = 70;
+        h.cpu_percent = 12.5;
+        h.disk_read_iops = 12.0;
+        s.insert_snapshot(&h).unwrap();
+        assert_eq!(s.latest_snapshot().unwrap().unwrap().cpu_percent, 12.5);
+        assert_eq!(
+            s.chart("cpu", h.timestamp - 1, 100).unwrap(),
+            vec![[h.timestamp as f64, 12.5]]
+        );
+        assert_eq!(
+            s.chart("disk_read_iops", h.timestamp - 1, 100).unwrap(),
+            vec![[h.timestamp as f64, 12.0]]
+        );
+    }
+    #[test]
+    fn incidents_deduplicate_and_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("test.sqlite")).unwrap();
+        let (id, created) = s
+            .open_or_update_incident(
+                "x",
+                "warning",
+                "Test",
+                0.8,
+                &serde_json::json!({"fact":1}),
+                "why",
+                100,
+            )
+            .unwrap();
+        let (same, created_again) = s
+            .open_or_update_incident(
+                "x",
+                "critical",
+                "Test",
+                0.9,
+                &serde_json::json!({"fact":2}),
+                "why",
+                120,
+            )
+            .unwrap();
+        assert_eq!(id, same);
+        assert!(created);
+        assert!(!created_again);
+        assert_eq!(s.incidents(true, 10).unwrap().len(), 1);
+        assert!(s.recover_incident("x", 200).unwrap());
+        assert_eq!(s.incidents(true, 10).unwrap().len(), 0);
+    }
+}

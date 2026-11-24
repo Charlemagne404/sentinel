@@ -1,0 +1,850 @@
+use crate::{
+    config::Config,
+    model::{
+        GpuSnapshot, HostSnapshot, NetworkSnapshot, ProcessSnapshot, ServiceSnapshot,
+        TemperatureReading,
+    },
+    notifications::Dispatcher,
+    processes::ProcessCollector,
+    storage::{Store, unix_now},
+};
+use std::{
+    collections::HashMap,
+    fs,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use tokio::sync::{RwLock, watch};
+use tracing::{debug, warn};
+
+#[derive(Clone)]
+pub struct LiveState {
+    pub latest: Arc<RwLock<Option<HostSnapshot>>>,
+    pub processes: Arc<RwLock<Vec<ProcessSnapshot>>>,
+    pub services: Arc<RwLock<Vec<ServiceSnapshot>>>,
+    revision: watch::Sender<u64>,
+}
+impl LiveState {
+    pub fn new() -> Self {
+        let (revision, _) = watch::channel(0);
+        Self {
+            latest: Arc::new(RwLock::new(None)),
+            processes: Arc::new(RwLock::new(Vec::new())),
+            services: Arc::new(RwLock::new(Vec::new())),
+            revision,
+        }
+    }
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.revision.subscribe()
+    }
+    pub fn changed(&self) {
+        self.revision.send_modify(|n| *n = n.wrapping_add(1));
+    }
+}
+
+#[derive(Clone)]
+pub struct Monitor {
+    config: Arc<RwLock<Config>>,
+    store: Store,
+    notifications: Dispatcher,
+    live: LiveState,
+    processes: Arc<Mutex<ProcessCollector>>,
+}
+impl Monitor {
+    pub fn new(config: Config, store: Store, notifications: Dispatcher) -> Self {
+        Self {
+            config: Arc::new(RwLock::new(config)),
+            store,
+            notifications,
+            live: LiveState::new(),
+            processes: Arc::new(Mutex::new(ProcessCollector::new())),
+        }
+    }
+    pub fn live(&self) -> LiveState {
+        self.live.clone()
+    }
+    pub fn config(&self) -> Arc<RwLock<Config>> {
+        self.config.clone()
+    }
+
+    pub async fn run(self) -> anyhow::Result<()> {
+        let initial = self.config.read().await.clone();
+        let mut counters = Counters::default();
+        let mut latest_temps = Vec::new();
+        let mut latest_gpu = None;
+        let mut last_host = Instant::now() - Duration::from_secs(initial.collection.host_seconds);
+        let mut last_process =
+            Instant::now() - Duration::from_secs(initial.collection.process_seconds);
+        let mut last_hardware =
+            Instant::now() - Duration::from_secs(initial.collection.hardware_seconds);
+        let mut last_service =
+            Instant::now() - Duration::from_secs(initial.collection.service_seconds);
+        let mut last_history = Instant::now() - Duration::from_secs(30);
+        let mut last_cleanup = Instant::now();
+        let mut last_cleanup_defer = Instant::now();
+        let mut last_intel_bucket = 0_i64;
+        let mut evaluator = crate::intelligence::Evaluator::default();
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let config = self.config.read().await.clone();
+            let now = Instant::now();
+            let epoch = unix_now();
+            let overloaded = self
+                .live
+                .latest
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(host_is_overloaded);
+            let mut did_update = false;
+            let process_interval = if overloaded {
+                config.collection.process_seconds.saturating_mul(3).min(300)
+            } else {
+                config.collection.process_seconds
+            };
+            if now.duration_since(last_process).as_secs() >= process_interval {
+                last_process = now;
+                let collector = self.processes.clone();
+                let collected = tokio::task::spawn_blocking(move || {
+                    collector
+                        .lock()
+                        .map(|mut c| c.collect())
+                        .unwrap_or_default()
+                })
+                .await
+                .unwrap_or_default();
+                if now.duration_since(last_history).as_secs() >= 30 {
+                    if let Err(e) = self.store.save_processes(epoch, &collected) {
+                        warn!(error=%e,"failed to persist process sample");
+                    }
+                    last_history = now;
+                }
+                *self.live.processes.write().await = collected;
+                did_update = true;
+            }
+            if now.duration_since(last_hardware).as_secs() >= config.collection.hardware_seconds {
+                last_hardware = now;
+                latest_temps = read_temperatures();
+                latest_gpu = read_gpu().await;
+            }
+            if now.duration_since(last_service).as_secs() >= config.collection.service_seconds {
+                last_service = now;
+                let services = collect_services().await;
+                *self.live.services.write().await = services;
+                did_update = true;
+            }
+            if now.duration_since(last_host).as_secs() >= config.collection.host_seconds {
+                let elapsed = now.duration_since(last_host).as_secs_f64().max(0.1);
+                last_host = now;
+                let processes = self.live.processes.read().await.clone();
+                let mut snapshot = collect_host(
+                    &mut counters,
+                    elapsed,
+                    &latest_temps,
+                    latest_gpu.clone(),
+                    &processes,
+                );
+                snapshot.timestamp = epoch;
+                if let Err(e) = self.store.insert_snapshot(&snapshot) {
+                    warn!(error=%e,"failed to write host sample");
+                }
+                *self.live.latest.write().await = Some(snapshot.clone());
+                if did_update || epoch % 5 == 0 {
+                    self.live.changed();
+                }
+                let bucket = epoch.div_euclid(60);
+                if bucket != last_intel_bucket {
+                    last_intel_bucket = bucket;
+                    if let Err(e) = self.store.aggregate_until(epoch) {
+                        warn!(error=%e,"metric aggregation failed");
+                    }
+                    match evaluator.evaluate(&self.store, &config, &snapshot, &processes, epoch) {
+                        Ok(notices) => {
+                            for notice in notices {
+                                self.notifications.notify(&config, notice).await;
+                            }
+                        }
+                        Err(e) => warn!(error=%e,"intelligence evaluation failed"),
+                    }
+                    self.live.changed();
+                }
+            }
+            if now.duration_since(last_cleanup).as_secs() >= 3600 {
+                if overloaded {
+                    if now.duration_since(last_cleanup_defer).as_secs() >= 300 {
+                        last_cleanup_defer = now;
+                        debug!("database maintenance deferred while host pressure is high");
+                    }
+                } else {
+                    last_cleanup = now;
+                    match self.store.cleanup(
+                        epoch,
+                        config.collection.retention_hours,
+                        config.server.database_budget_mb,
+                    ) {
+                        Ok(size) => debug!(database_bytes = size, "retention complete"),
+                        Err(e) => warn!(error=%e,"retention maintenance failed"),
+                    }
+                }
+            }
+            if did_update {
+                self.live.changed();
+            }
+        }
+    }
+}
+
+fn host_is_overloaded(host: &HostSnapshot) -> bool {
+    let available = if host.memory_total_bytes > 0 {
+        host.memory_available_bytes as f64 / host.memory_total_bytes as f64
+    } else {
+        1.0
+    };
+    available < 0.10
+        || host.psi_cpu_some_percent.is_some_and(|value| value > 50.0)
+        || host
+            .psi_memory_some_percent
+            .is_some_and(|value| value > 20.0)
+        || host
+            .cpu_temperature_c
+            .zip(host.cpu_temperature_limit_c)
+            .is_some_and(|(temperature, limit)| limit > 0.0 && temperature >= limit * 0.95)
+}
+
+#[derive(Default)]
+struct Counters {
+    cpu: Option<(CpuTimes, Instant)>,
+    core_cpu: HashMap<String, (CpuTimes, Instant)>,
+    vm: Option<(u64, u64, Instant)>,
+    net: HashMap<String, (u64, u64, Instant)>,
+    disk: Option<(u64, u64, u64, u64, Instant)>,
+}
+#[derive(Clone, Copy, Default)]
+struct CpuTimes {
+    total: u64,
+    idle: u64,
+    user: u64,
+    system: u64,
+    iowait: u64,
+}
+
+fn collect_host(
+    c: &mut Counters,
+    elapsed: f64,
+    temps: &[TemperatureReading],
+    gpu: Option<GpuSnapshot>,
+    processes: &[ProcessSnapshot],
+) -> HostSnapshot {
+    let timestamp = unix_now();
+    let cpu = read_cpu();
+    let mut usage = (0.0, 0.0, 0.0, 0.0, Vec::new());
+    let _ = elapsed;
+    if let Some((_, current)) = cpu.first() {
+        if let Some((old, _when)) = c.cpu {
+            let dt = current.total.saturating_sub(old.total) as f64;
+            let pct = |a: u64, b: u64| {
+                if dt > 0.0 {
+                    a.saturating_sub(b) as f64 / dt * 100.0
+                } else {
+                    0.0
+                }
+            };
+            usage.0 = pct(
+                current.total.saturating_sub(current.idle),
+                old.total.saturating_sub(old.idle),
+            );
+            usage.1 = pct(current.user, old.user);
+            usage.2 = pct(current.system, old.system);
+            usage.3 = pct(current.iowait, old.iowait);
+        }
+        c.cpu = Some((*current, Instant::now()));
+    }
+    for (name, current) in cpu.iter().skip(1) {
+        if let Some((old, _)) = c.core_cpu.get(name) {
+            let dt = current.total.saturating_sub(old.total) as f64;
+            let busy = current
+                .total
+                .saturating_sub(current.idle)
+                .saturating_sub(old.total.saturating_sub(old.idle));
+            usage.4.push(if dt > 0.0 {
+                busy as f64 / dt * 100.0
+            } else {
+                0.0
+            });
+        } else {
+            usage.4.push(0.0)
+        }
+        c.core_cpu.insert(name.clone(), (*current, Instant::now()));
+    }
+    let mem = read_meminfo();
+    let vm = read_vmstat();
+    let mut swap_in = 0.0;
+    let mut swap_out = 0.0;
+    if let Some((old_in, old_out, when)) = c.vm {
+        let dt = when.elapsed().as_secs_f64().max(0.1);
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as f64;
+        swap_in = vm.0.saturating_sub(old_in) as f64 * page / dt;
+        swap_out = vm.1.saturating_sub(old_out) as f64 * page / dt;
+    }
+    c.vm = Some((vm.0, vm.1, Instant::now()));
+    let net = read_network();
+    let mut interfaces = Vec::new();
+    let mut rx_rate = 0.0;
+    let mut tx_rate = 0.0;
+    for (name, values) in net {
+        let state = fs::read_to_string(format!("/sys/class/net/{name}/operstate"))
+            .unwrap_or_else(|_| "unknown".into())
+            .trim()
+            .to_string();
+        let mut iface_rx = 0.0;
+        let mut iface_tx = 0.0;
+        if let Some((old_rx, old_tx, when)) = c.net.get(&name) {
+            let dt = when.elapsed().as_secs_f64().max(0.1);
+            iface_rx = values.0.saturating_sub(*old_rx) as f64 / dt;
+            iface_tx = values.1.saturating_sub(*old_tx) as f64 / dt;
+            if !name.starts_with("lo")
+                && !name.starts_with("br-")
+                && !name.starts_with("veth")
+                && !name.starts_with("docker")
+                && name != "tailscale0"
+            {
+                rx_rate += iface_rx;
+                tx_rate += iface_tx;
+            }
+        }
+        c.net
+            .insert(name.clone(), (values.0, values.1, Instant::now()));
+        interfaces.push(NetworkSnapshot {
+            name,
+            state,
+            rx_bytes: values.0,
+            tx_bytes: values.1,
+            rx_bytes_per_sec: iface_rx,
+            tx_bytes_per_sec: iface_tx,
+            rx_packets: values.2,
+            tx_packets: values.3,
+            rx_errors: values.4,
+            tx_errors: values.6,
+            rx_dropped: values.5,
+            tx_dropped: values.7,
+        });
+    }
+    let disk = read_diskstats();
+    let mut read_rate = 0.0;
+    let mut write_rate = 0.0;
+    let mut read_iops = 0.0;
+    let mut write_iops = 0.0;
+    if let Some((old_r, old_w, old_read_ops, old_write_ops, when)) = c.disk {
+        let dt = when.elapsed().as_secs_f64().max(0.1);
+        read_rate = disk.0.saturating_sub(old_r) as f64 / dt;
+        write_rate = disk.1.saturating_sub(old_w) as f64 / dt;
+        read_iops = disk.2.saturating_sub(old_read_ops) as f64 / dt;
+        write_iops = disk.3.saturating_sub(old_write_ops) as f64 / dt;
+    }
+    c.disk = Some((disk.0, disk.1, disk.2, disk.3, Instant::now()));
+    let (disk_total, disk_free) = read_disk_capacity();
+    let load = read_load();
+    let uptime = read_uptime();
+    let cpu_temp = temps
+        .iter()
+        .filter(|t| t.device.to_lowercase().contains("coretemp"))
+        .map(|t| t.celsius)
+        .reduce(f64::max);
+    let cpu_limit = temps
+        .iter()
+        .filter(|t| t.device.to_lowercase().contains("coretemp"))
+        .filter_map(|t| t.limit_celsius)
+        .reduce(f64::min);
+    let active_workloads = processes
+        .iter()
+        .map(|p| p.workload.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    HostSnapshot {
+        timestamp,
+        hostname: fs::read_to_string("/etc/hostname")
+            .unwrap_or_else(|_| "localhost".into())
+            .trim()
+            .to_string(),
+        uptime_seconds: uptime,
+        cpu_percent: usage.0.clamp(0.0, 100.0),
+        cpu_user_percent: usage.1,
+        cpu_system_percent: usage.2,
+        cpu_iowait_percent: usage.3,
+        per_core: usage.4,
+        cpu_frequency_mhz: read_frequency(),
+        load,
+        memory_total_bytes: mem.total,
+        memory_available_bytes: mem.available,
+        memory_used_bytes: mem.total.saturating_sub(mem.available),
+        memory_cached_bytes: mem.cached,
+        memory_buffers_bytes: mem.buffers,
+        swap_total_bytes: mem.swap_total,
+        swap_free_bytes: mem.swap_free,
+        swap_in_bytes_per_sec: swap_in,
+        swap_out_bytes_per_sec: swap_out,
+        psi_cpu_some_percent: read_psi("cpu", "some"),
+        psi_memory_some_percent: read_psi("memory", "some"),
+        psi_memory_full_percent: read_psi("memory", "full"),
+        psi_io_some_percent: read_psi("io", "some"),
+        cpu_temperature_c: cpu_temp,
+        cpu_temperature_limit_c: cpu_limit,
+        temperatures: temps.to_vec(),
+        thermal_throttle_count: read_throttle_count(),
+        disk_total_bytes: disk_total,
+        disk_available_bytes: disk_free,
+        disk_read_bytes_per_sec: read_rate,
+        disk_write_bytes_per_sec: write_rate,
+        disk_read_iops: read_iops,
+        disk_write_iops: write_iops,
+        network_rx_bytes_per_sec: rx_rate,
+        network_tx_bytes_per_sec: tx_rate,
+        network_interfaces: interfaces,
+        gpu,
+        process_count: processes.len(),
+        active_workloads,
+        collection_degraded: degraded_capabilities(),
+    }
+}
+
+fn degraded_capabilities() -> Vec<String> {
+    let mut d = Vec::new();
+    if !Path::new("/proc/pressure/cpu").exists() {
+        d.push("CPU PSI unavailable".into());
+    }
+    if !Path::new("/sys/class/hwmon").exists() {
+        d.push("hardware sensors unavailable".into());
+    }
+    if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        d.push("cgroup v2 unavailable".into());
+    }
+    d
+}
+fn read_cpu() -> Vec<(String, CpuTimes)> {
+    let Ok(raw) = fs::read_to_string("/proc/stat") else {
+        return Vec::new();
+    };
+    parse_cpu(&raw)
+}
+fn parse_cpu(raw: &str) -> Vec<(String, CpuTimes)> {
+    raw.lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let name = f.next()?;
+            if !name.starts_with("cpu") {
+                return None;
+            }
+            let v = f.filter_map(|x| x.parse::<u64>().ok()).collect::<Vec<_>>();
+            if v.len() < 4 {
+                return None;
+            }
+            let user = v[0] + v.get(1).copied().unwrap_or(0);
+            let system = v.get(2).copied().unwrap_or(0)
+                + v.get(5).copied().unwrap_or(0)
+                + v.get(6).copied().unwrap_or(0);
+            let idle = v.get(3).copied().unwrap_or(0) + v.get(4).copied().unwrap_or(0);
+            let io = v.get(4).copied().unwrap_or(0);
+            Some((
+                name.to_string(),
+                CpuTimes {
+                    total: v.iter().sum(),
+                    idle,
+                    user,
+                    system,
+                    iowait: io,
+                },
+            ))
+        })
+        .collect()
+}
+#[derive(Default)]
+struct Memory {
+    total: u64,
+    available: u64,
+    cached: u64,
+    buffers: u64,
+    swap_total: u64,
+    swap_free: u64,
+}
+fn read_meminfo() -> Memory {
+    let raw = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    parse_meminfo(&raw)
+}
+fn parse_meminfo(raw: &str) -> Memory {
+    let mut m = Memory::default();
+    for line in raw.lines() {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let val = v
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+            .saturating_mul(1024);
+        match k {
+            "MemTotal" => m.total = val,
+            "MemAvailable" => m.available = val,
+            "Cached" => m.cached = val,
+            "Buffers" => m.buffers = val,
+            "SwapTotal" => m.swap_total = val,
+            "SwapFree" => m.swap_free = val,
+            _ => {}
+        }
+    }
+    m
+}
+fn read_vmstat() -> (u64, u64) {
+    let raw = fs::read_to_string("/proc/vmstat").unwrap_or_default();
+    parse_vmstat(&raw)
+}
+fn parse_vmstat(raw: &str) -> (u64, u64) {
+    let mut a = 0;
+    let mut b = 0;
+    for l in raw.lines() {
+        let mut p = l.split_whitespace();
+        match p.next() {
+            Some("pswpin") => a = p.next().and_then(|x| x.parse().ok()).unwrap_or(0),
+            Some("pswpout") => b = p.next().and_then(|x| x.parse().ok()).unwrap_or(0),
+            _ => {}
+        }
+    }
+    (a, b)
+}
+fn read_load() -> [f64; 3] {
+    fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| {
+            let mut i = s.split_whitespace().take(3).filter_map(|x| x.parse().ok());
+            Some([i.next()?, i.next()?, i.next()?])
+        })
+        .unwrap_or([0.0; 3])
+}
+fn read_uptime() -> u64 {
+    fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+        .unwrap_or(0.0) as u64
+}
+fn read_psi(kind: &str, group: &str) -> Option<f64> {
+    let raw = fs::read_to_string(format!("/proc/pressure/{kind}")).ok()?;
+    parse_psi_text(&raw, group)
+}
+fn parse_psi_text(raw: &str, group: &str) -> Option<f64> {
+    let row = raw.lines().find(|l| l.starts_with(group))?;
+    row.split_whitespace()
+        .find_map(|x| x.strip_prefix("avg10=")?.parse().ok())
+}
+type NetworkCounters = HashMap<String, (u64, u64, u64, u64, u64, u64, u64, u64)>;
+
+fn read_network() -> NetworkCounters {
+    let Ok(raw) = fs::read_to_string("/proc/net/dev") else {
+        return HashMap::new();
+    };
+    parse_network(&raw)
+}
+fn parse_network(raw: &str) -> NetworkCounters {
+    raw.lines()
+        .skip(2)
+        .filter_map(|l| {
+            let (name, v) = l.trim().split_once(':')?;
+            let f = v
+                .split_whitespace()
+                .filter_map(|x| x.parse::<u64>().ok())
+                .collect::<Vec<_>>();
+            if f.len() < 16 {
+                return None;
+            }
+            Some((
+                name.trim().to_string(),
+                (f[0], f[8], f[1], f[9], f[2], f[3], f[10], f[11]),
+            ))
+        })
+        .collect()
+}
+fn read_diskstats() -> (u64, u64, u64, u64) {
+    let Ok(raw) = fs::read_to_string("/proc/diskstats") else {
+        return (0, 0, 0, 0);
+    };
+    let mut result = (0_u64, 0_u64, 0_u64, 0_u64);
+    for (name, read_bytes, write_bytes, reads, writes) in parse_diskstats(&raw) {
+        if name.starts_with("loop")
+            || name.starts_with("ram")
+            || name.starts_with("zram")
+            || name.starts_with("dm-")
+            || name.starts_with("md")
+            || !Path::new(&format!("/sys/block/{name}")).exists()
+        {
+            continue;
+        }
+        result.0 = result.0.saturating_add(read_bytes);
+        result.1 = result.1.saturating_add(write_bytes);
+        result.2 = result.2.saturating_add(reads);
+        result.3 = result.3.saturating_add(writes);
+    }
+    result
+}
+fn parse_diskstats(raw: &str) -> Vec<(String, u64, u64, u64, u64)> {
+    let mut out = Vec::new();
+    for l in raw.lines() {
+        let f = l.split_whitespace().collect::<Vec<_>>();
+        if f.len() < 14 {
+            continue;
+        }
+        out.push((
+            f[2].to_string(),
+            f[5].parse::<u64>().unwrap_or(0).saturating_mul(512),
+            f[9].parse::<u64>().unwrap_or(0).saturating_mul(512),
+            f[3].parse::<u64>().unwrap_or(0),
+            f[7].parse::<u64>().unwrap_or(0),
+        ));
+    }
+    out
+}
+fn read_disk_capacity() -> (u64, u64) {
+    use std::ffi::CString;
+    let path = CString::new("/").unwrap();
+    let mut s = unsafe { std::mem::zeroed::<libc::statvfs>() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut s) } == 0 {
+        let unit = s.f_frsize as u64;
+        (s.f_blocks as u64 * unit, s.f_bavail as u64 * unit)
+    } else {
+        (0, 0)
+    }
+}
+fn read_frequency() -> Option<f64> {
+    fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+        .ok()?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .map(|v| v / 1000.0)
+}
+fn read_throttle_count() -> u64 {
+    fs::read_dir("/sys/devices/system/cpu")
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("cpu"))
+        .filter_map(|e| {
+            fs::read_to_string(e.path().join("thermal_throttle/core_throttle_count"))
+                .ok()?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+        .sum()
+}
+
+pub fn read_temperatures() -> Vec<TemperatureReading> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/hwmon") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let base = entry.path();
+        let device = fs::read_to_string(base.join("name"))
+            .unwrap_or_else(|_| "sensor".into())
+            .trim()
+            .to_string();
+        let Ok(files) = fs::read_dir(&base) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let fname = file.file_name().to_string_lossy().to_string();
+            if !fname.starts_with("temp") || !fname.ends_with("_input") {
+                continue;
+            }
+            let idx = fname.trim_start_matches("temp").trim_end_matches("_input");
+            let Ok(raw) = fs::read_to_string(file.path()) else {
+                continue;
+            };
+            let Ok(milli) = raw.trim().parse::<f64>() else {
+                continue;
+            };
+            let label = fs::read_to_string(base.join(format!("temp{idx}_label")))
+                .unwrap_or_else(|_| format!("sensor {idx}"))
+                .trim()
+                .to_string();
+            let limit = ["crit", "max"]
+                .iter()
+                .find_map(|k| {
+                    fs::read_to_string(base.join(format!("temp{idx}_{k}")))
+                        .ok()?
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                })
+                .map(|v| v / 1000.0);
+            out.push(TemperatureReading {
+                device: device.clone(),
+                sensor: label,
+                celsius: milli / 1000.0,
+                limit_celsius: limit,
+            });
+        }
+    }
+    out
+}
+
+async fn read_gpu() -> Option<GpuSnapshot> {
+    let command = tokio::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+            "--format=csv,noheader,nounits",
+        ])
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(3), command)
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()?
+        .to_string();
+    let f = line.split(',').map(str::trim).collect::<Vec<_>>();
+    if f.len() < 6 {
+        return None;
+    }
+    let parse = |s: &str| {
+        if s == "[N/A]" || s == "N/A" {
+            None
+        } else {
+            s.parse::<f64>().ok()
+        }
+    };
+    Some(GpuSnapshot {
+        name: Some(f[0].to_string()),
+        utilization_percent: parse(f[1]),
+        memory_used_bytes: parse(f[2]).map(|v| (v * 1024.0 * 1024.0) as u64),
+        memory_total_bytes: parse(f[3]).map(|v| (v * 1024.0 * 1024.0) as u64),
+        temperature_c: parse(f[4]),
+        power_watts: parse(f[5]),
+    })
+}
+
+async fn collect_services() -> Vec<ServiceSnapshot> {
+    let (mut all, system) = tokio::join!(collect_service_scope(true), collect_service_scope(false));
+    all.extend(system);
+    all.sort_by(|a, b| a.name.cmp(&b.name));
+    all.dedup_by(|a, b| a.name == b.name);
+    all.truncate(500);
+    all
+}
+
+async fn collect_service_scope(user: bool) -> Vec<ServiceSnapshot> {
+    let mut command = tokio::process::Command::new("systemctl");
+    if user {
+        command.arg("--user");
+    } else {
+        command.arg("--no-ask-password");
+    }
+    command
+        .args([
+            "list-units",
+            "--type=service",
+            "--all",
+            "--no-legend",
+            "--no-pager",
+            "--plain",
+        ])
+        .kill_on_drop(true);
+    let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(3), command.output()).await
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 4 || !fields[0].ends_with(".service") {
+                return None;
+            }
+            Some(ServiceSnapshot {
+                name: fields[0].to_string(),
+                load: fields[1].to_string(),
+                active: fields[2].to_string(),
+                sub: fields[3].to_string(),
+                description: fields.get(4..).unwrap_or_default().join(" "),
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn psi_parser_reads_avg10() {
+        let raw = "some avg10=1.25 avg60=0.70 avg300=0.20 total=42\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0";
+        assert_eq!(parse_psi_text(raw, "some"), Some(1.25));
+    }
+    #[test]
+    fn psi_missing_is_none() {
+        assert_eq!(parse_psi_text("full avg10=0.0", "some"), None);
+    }
+
+    #[test]
+    fn cpu_parser_reads_total_and_per_core_counters() {
+        let parsed = parse_cpu("cpu  10 2 3 40 5 6 7 8 0 0\ncpu0 5 1 2 20 2 3 4 5 0 0\nintr 123");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, "cpu");
+        assert_eq!(parsed[0].1.total, 81);
+        assert_eq!(parsed[0].1.idle, 45);
+        assert_eq!(parsed[1].0, "cpu0");
+    }
+
+    #[test]
+    fn memory_parser_converts_kib_and_swap_counters_are_separate() {
+        let mem = parse_meminfo(
+            "MemTotal: 1024 kB\nMemAvailable: 768 kB\nCached: 128 kB\nBuffers: 16 kB\nSwapTotal: 512 kB\nSwapFree: 256 kB\n",
+        );
+        assert_eq!(mem.total, 1_048_576);
+        assert_eq!(mem.available, 786_432);
+        assert_eq!(mem.swap_total - mem.swap_free, 262_144);
+        assert_eq!(
+            parse_vmstat("pswpin 12\npswpout 34\npgfault 99\n"),
+            (12, 34)
+        );
+    }
+
+    #[test]
+    fn network_parser_preserves_counters_by_interface() {
+        let parsed = parse_network(
+            "Inter-| Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\neth0: 100 2 3 4 5 6 7 8 200 9 10 11 12 13 14 15\n",
+        );
+        assert_eq!(parsed.get("eth0"), Some(&(100, 200, 2, 9, 3, 4, 10, 11)));
+    }
+
+    #[test]
+    fn adaptive_pressure_guard_uses_observed_memory_and_psi() {
+        let mut host = HostSnapshot {
+            memory_total_bytes: 1000,
+            memory_available_bytes: 200,
+            ..HostSnapshot::default()
+        };
+        assert!(!host_is_overloaded(&host));
+        host.memory_available_bytes = 90;
+        assert!(host_is_overloaded(&host));
+        host.memory_available_bytes = 200;
+        host.psi_cpu_some_percent = Some(51.0);
+        assert!(host_is_overloaded(&host));
+    }
+
+    #[test]
+    fn diskstats_parser_extracts_throughput_and_operation_counters() {
+        let rows = parse_diskstats("8 0 sda 10 2 30 40 50 6 70 80 0 90 100 110\n");
+        assert_eq!(rows, vec![("sda".into(), 30 * 512, 70 * 512, 10, 50)]);
+    }
+}
