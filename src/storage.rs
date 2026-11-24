@@ -7,13 +7,50 @@ use rusqlite::{Connection, OptionalExtension, backup::Backup, params};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicI64, Ordering},
+    },
 };
 
 #[derive(Clone)]
 pub struct Store {
     path: Arc<PathBuf>,
     connection: Arc<Mutex<Connection>>,
+    history_degraded: Arc<AtomicBool>,
+    last_metric_bucket: Arc<AtomicI64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DatabaseObjectSize {
+    pub name: String,
+    pub kind: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DatabaseFileSizes {
+    pub main_bytes: u64,
+    pub wal_bytes: u64,
+    pub shm_bytes: u64,
+    pub journal_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DatabaseCleanupReport {
+    pub size_bytes: u64,
+    pub budget_bytes: u64,
+    pub pressure_stage: String,
+    pub pressure_rows_pruned: u64,
+    pub over_budget: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RawRetention {
+    pub host_samples_oldest_at: Option<i64>,
+    pub process_samples_oldest_at: Option<i64>,
+    pub metric_points_oldest_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -88,11 +125,12 @@ impl Store {
         conn.execute_batch("BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS host_samples(ts INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS latest_snapshot(id INTEGER PRIMARY KEY CHECK(id=1), ts INTEGER NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS metric_points(ts INTEGER NOT NULL, name TEXT NOT NULL, value REAL NOT NULL, PRIMARY KEY(ts,name)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS metric_points_lookup ON metric_points(name,ts);
-            CREATE TABLE IF NOT EXISTS minute_points(ts INTEGER NOT NULL, name TEXT NOT NULL, value REAL NOT NULL, PRIMARY KEY(ts,name)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS minute_points(ts INTEGER NOT NULL, name TEXT NOT NULL, value REAL NOT NULL, min_value REAL, max_value REAL, PRIMARY KEY(ts,name)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS minute_points_lookup ON minute_points(name,ts);
-            CREATE TABLE IF NOT EXISTS quarter_points(ts INTEGER NOT NULL, name TEXT NOT NULL, value REAL NOT NULL, PRIMARY KEY(ts,name)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS quarter_points(ts INTEGER NOT NULL, name TEXT NOT NULL, value REAL NOT NULL, min_value REAL, max_value REAL, PRIMARY KEY(ts,name)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS quarter_points_lookup ON quarter_points(name,ts);
             CREATE TABLE IF NOT EXISTS process_samples(ts INTEGER NOT NULL, proc_key TEXT NOT NULL, pid INTEGER NOT NULL, ppid INTEGER NOT NULL, uid INTEGER NOT NULL, name TEXT NOT NULL, executable TEXT, state TEXT NOT NULL, start_ticks INTEGER NOT NULL, runtime_seconds INTEGER NOT NULL, cpu_percent REAL NOT NULL, rss_bytes INTEGER NOT NULL, virtual_bytes INTEGER NOT NULL, process_group INTEGER NOT NULL, session INTEGER NOT NULL, cgroup TEXT, workload TEXT NOT NULL, parent_disappeared INTEGER NOT NULL, PRIMARY KEY(ts,proc_key)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS process_samples_key ON process_samples(proc_key,ts);
@@ -137,6 +175,23 @@ impl Store {
                 [],
             )?;
         }
+        for (table, column) in [
+            ("minute_points", "min_value"),
+            ("minute_points", "max_value"),
+            ("quarter_points", "min_value"),
+            ("quarter_points", "max_value"),
+        ] {
+            let exists: bool = conn.query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name='{column}')"
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} REAL"))?;
+            }
+        }
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,unixepoch()),(3,unixepoch()),(4,unixepoch()),(5,unixepoch())",
             [],
@@ -144,6 +199,8 @@ impl Store {
         Ok(Self {
             path: Arc::new(path.to_path_buf()),
             connection: Arc::new(Mutex::new(conn)),
+            history_degraded: Arc::new(AtomicBool::new(false)),
+            last_metric_bucket: Arc::new(AtomicI64::new(i64::MIN)),
         })
     }
 
@@ -167,11 +224,25 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         let payload = serde_json::to_string(snapshot)?;
         tx.execute(
-            "INSERT OR REPLACE INTO host_samples(ts,payload) VALUES(?1,?2)",
+            "INSERT INTO latest_snapshot(id,ts,payload) VALUES(1,?1,?2)
+             ON CONFLICT(id) DO UPDATE SET ts=excluded.ts,payload=excluded.payload
+             WHERE excluded.ts>=latest_snapshot.ts",
             params![snapshot.timestamp, payload],
         )?;
-        let metrics = snapshot.metrics();
-        {
+        let snapshot_minute = snapshot.timestamp.div_euclid(60) * 60;
+        tx.execute(
+            "INSERT OR REPLACE INTO host_samples(ts,payload) VALUES(?1,?2)",
+            params![snapshot_minute, serde_json::to_string(snapshot)?],
+        )?;
+        let degraded = self.history_degraded.load(Ordering::Relaxed);
+        let metric_bucket = snapshot.timestamp.div_euclid(30);
+        let store_metrics = !degraded
+            || self
+                .last_metric_bucket
+                .swap(metric_bucket, Ordering::Relaxed)
+                != metric_bucket;
+        if store_metrics {
+            let metrics = snapshot.metrics();
             let mut stmt = tx.prepare_cached(
                 "INSERT OR REPLACE INTO metric_points(ts,name,value) VALUES(?1,?2,?3)",
             )?;
@@ -190,6 +261,9 @@ impl Store {
         timestamp: i64,
         metrics: &[(String, f64)],
     ) -> anyhow::Result<()> {
+        if self.history_degraded.load(Ordering::Relaxed) && timestamp.rem_euclid(300) >= 60 {
+            return Ok(());
+        }
         let conn = self.lock()?;
         let tx = conn.unchecked_transaction()?;
         let mut statement = tx.prepare_cached(
@@ -257,14 +331,13 @@ impl Store {
     }
 
     pub fn save_processes(&self, ts: i64, processes: &[ProcessSnapshot]) -> anyhow::Result<()> {
-        let mut selected = Vec::with_capacity(120);
+        let mut selected = Vec::with_capacity(50);
         let mut by_cpu = processes.iter().collect::<Vec<_>>();
         by_cpu.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
-        selected.extend(by_cpu.into_iter().take(50));
+        selected.extend(by_cpu.into_iter().take(25));
         let mut by_memory = processes.iter().collect::<Vec<_>>();
         by_memory.sort_by_key(|p| std::cmp::Reverse(p.rss_bytes));
-        selected.extend(by_memory.into_iter().take(50));
-        selected.extend(processes.iter().filter(|p| p.parent_disappeared));
+        selected.extend(by_memory.into_iter().take(25));
         let conn = self.lock()?;
         let tx = conn.unchecked_transaction()?;
         let mut stmt = tx.prepare_cached("INSERT OR REPLACE INTO process_samples(ts,proc_key,pid,ppid,uid,name,executable,state,start_ticks,runtime_seconds,cpu_percent,rss_bytes,virtual_bytes,process_group,session,cgroup,workload,parent_disappeared) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")?;
@@ -337,12 +410,20 @@ impl Store {
     pub fn latest_snapshot(&self) -> anyhow::Result<Option<HostSnapshot>> {
         let conn = self.lock()?;
         let raw: Option<String> = conn
-            .query_row(
-                "SELECT payload FROM host_samples ORDER BY ts DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT payload FROM latest_snapshot WHERE id=1", [], |r| {
+                r.get(0)
+            })
             .optional()?;
+        let raw = match raw {
+            Some(raw) => Some(raw),
+            None => conn
+                .query_row(
+                    "SELECT payload FROM host_samples ORDER BY ts DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?,
+        };
         raw.map(|s| serde_json::from_str(&s).map_err(Into::into))
             .transpose()
     }
@@ -364,7 +445,8 @@ impl Store {
         metric: &str,
         since: i64,
         max_points: usize,
-    ) -> anyhow::Result<Vec<[f64; 2]>> {
+    ) -> anyhow::Result<Vec<[f64; 4]>> {
+        let max_points = max_points.max(1);
         if !known_metric(metric) {
             anyhow::bail!("unknown metric");
         }
@@ -392,19 +474,45 @@ impl Store {
             };
         let sql = if group_seconds > 0 {
             format!(
-                "SELECT CAST(ts/{group_seconds} AS INTEGER)*{group_seconds},avg(value) FROM {table} WHERE name=? AND ts>=? GROUP BY 1 ORDER BY 1"
+                "SELECT CAST(ts/{group_seconds} AS INTEGER)*{group_seconds},avg(value),min(COALESCE(min_value,value)),max(COALESCE(max_value,value)) FROM {table} WHERE name=? AND ts>=? GROUP BY 1 ORDER BY 1"
             )
+        } else if table == "metric_points" {
+            format!("SELECT ts,value,value,value FROM {table} WHERE name=? AND ts>=? ORDER BY ts")
         } else {
-            format!("SELECT ts,value FROM {table} WHERE name=? AND ts>=? ORDER BY ts")
+            format!(
+                "SELECT ts,value,COALESCE(min_value,value),COALESCE(max_value,value) FROM {table} WHERE name=? AND ts>=? ORDER BY ts"
+            )
         };
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![metric, since], |r| {
-            Ok([r.get::<_, i64>(0)? as f64, r.get::<_, f64>(1)?])
+            Ok([
+                r.get::<_, i64>(0)? as f64,
+                r.get::<_, f64>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, f64>(3)?,
+            ])
         })?;
         let mut values = rows.collect::<Result<Vec<_>, _>>()?;
         if values.len() > max_points {
             let stride = (values.len() + max_points - 1) / max_points;
-            values = values.into_iter().step_by(stride).collect();
+            values = values
+                .chunks(stride)
+                .map(|chunk| {
+                    let last = chunk.last().copied().unwrap_or([0.0; 4]);
+                    [
+                        last[0],
+                        last[1],
+                        chunk
+                            .iter()
+                            .map(|point| point[2])
+                            .fold(f64::INFINITY, f64::min),
+                        chunk
+                            .iter()
+                            .map(|point| point[3])
+                            .fold(f64::NEG_INFINITY, f64::max),
+                    ]
+                })
+                .collect();
         }
         Ok(values)
     }
@@ -421,6 +529,23 @@ impl Store {
             .into_iter()
             .map(|(_, value)| value)
             .collect())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_minute_points_for_test(
+        &self,
+        points: &[(i64, &str, f64)],
+    ) -> anyhow::Result<()> {
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        for (timestamp, metric, value) in points {
+            tx.execute(
+                "INSERT INTO minute_points(ts,name,value) VALUES(?,?,?)",
+                params![timestamp, metric, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn baseline_observations(
@@ -758,17 +883,23 @@ impl Store {
         let bucket = now.div_euclid(60) * 60;
         let conn = self.lock()?;
         let tx = conn.unchecked_transaction()?;
-        tx.execute("INSERT OR REPLACE INTO minute_points(ts,name,value) SELECT CAST(ts/60 AS INTEGER)*60,name,avg(value) FROM metric_points WHERE ts>=? AND ts<? GROUP BY CAST(ts/60 AS INTEGER),name",params![bucket-60,bucket])?;
+        tx.execute("INSERT OR REPLACE INTO minute_points(ts,name,value,min_value,max_value) SELECT CAST(ts/60 AS INTEGER)*60,name,avg(value),min(value),max(value) FROM metric_points WHERE ts>=? AND ts<? GROUP BY CAST(ts/60 AS INTEGER),name",params![bucket-60,bucket])?;
         if bucket.rem_euclid(900) == 0 {
-            tx.execute("INSERT OR REPLACE INTO quarter_points(ts,name,value) SELECT CAST(ts/900 AS INTEGER)*900,name,avg(value) FROM minute_points WHERE ts>=? AND ts<? GROUP BY CAST(ts/900 AS INTEGER),name",params![bucket-900,bucket])?;
+            tx.execute("INSERT OR REPLACE INTO quarter_points(ts,name,value,min_value,max_value) SELECT CAST(ts/900 AS INTEGER)*900,name,avg(value),min(COALESCE(min_value,value)),max(COALESCE(max_value,value)) FROM minute_points WHERE name IN ('cpu','memory_used_percent','memory_available_percent','swap_used_percent','load_1m','cpu_pressure','memory_pressure','io_pressure','disk_used_percent','cpu_temperature_c') AND ts>=? AND ts<? GROUP BY CAST(ts/900 AS INTEGER),name",params![bucket-900,bucket])?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    pub fn cleanup(&self, now: i64, raw_hours: u64, budget_mb: u64) -> anyhow::Result<u64> {
+    pub fn cleanup(
+        &self,
+        now: i64,
+        raw_hours: u64,
+        budget_mb: u64,
+    ) -> anyhow::Result<DatabaseCleanupReport> {
         let conn = self.lock()?;
         let tx = conn.unchecked_transaction()?;
+        let process_history_hours = raw_hours.min(24);
         tx.execute(
             "DELETE FROM host_samples WHERE ts<?",
             [now - (raw_hours as i64 * 3600)],
@@ -779,14 +910,25 @@ impl Store {
         )?;
         tx.execute(
             "DELETE FROM process_samples WHERE ts<?",
-            [now - (raw_hours as i64 * 3600)],
+            [now - (process_history_hours as i64 * 3600)],
         )?;
         tx.execute(
             "DELETE FROM process_lifecycle_events WHERE ts<?",
             [now - 7 * 86400],
         )?;
-        tx.execute("DELETE FROM minute_points WHERE ts<?", [now - 30 * 86400])?;
-        tx.execute("DELETE FROM quarter_points WHERE ts<?", [now - 365 * 86400])?;
+        tx.execute(
+            "DELETE FROM minute_points WHERE ts<? AND name NOT IN ('cpu','memory_used_percent','memory_available_percent','swap_used_percent','load_1m','cpu_pressure','memory_pressure','io_pressure','disk_used_percent','cpu_temperature_c')",
+            [now - 7 * 86400],
+        )?;
+        tx.execute(
+            "DELETE FROM minute_points WHERE name LIKE 'workload::%' AND ts<?",
+            [now - 2 * 86400],
+        )?;
+        tx.execute(
+            "DELETE FROM minute_points WHERE name IN ('cpu','memory_used_percent','memory_available_percent','swap_used_percent','load_1m','cpu_pressure','memory_pressure','io_pressure','disk_used_percent','cpu_temperature_c') AND ts<?",
+            [now - 14 * 86400],
+        )?;
+        tx.execute("DELETE FROM quarter_points WHERE ts<?", [now - 180 * 86400])?;
         tx.execute(
             "DELETE FROM incidents WHERE status='recovered' AND recovered_at<?",
             [now - 365 * 86400],
@@ -803,46 +945,219 @@ impl Store {
         )?;
         tx.execute("DELETE FROM sessions WHERE expires_at<?", [now])?;
         tx.commit()?;
-        let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
+        if let Err(error) = checkpoint_wal(&conn, "PASSIVE", false) {
+            tracing::warn!(error=%error,"SQLite passive WAL checkpoint failed during retention");
+        }
+        let budget = budget_mb.saturating_mul(1024 * 1024);
         let mut bytes = self.database_size_bytes();
-        let budget = budget_mb * 1024 * 1024;
-        if bytes > budget {
-            conn.execute(
-                "DELETE FROM process_lifecycle_events WHERE ts<?",
-                [now - 86400],
+        let mut pressure_stage = "normal";
+        let mut rows_pruned = 0_u64;
+
+        // Start shedding lower-value detail before the hard budget is reached.
+        // Incident rows and their evidence are never included in these deletes.
+        if bytes.saturating_mul(100) > budget.saturating_mul(90) {
+            pressure_stage = "process-history-12h";
+            rows_pruned += delete_batch_before(
+                &conn,
+                "process_samples",
+                "ts,proc_key",
+                "ts<?1",
+                "ts,proc_key",
+                now - (process_history_hours.min(12) as i64 * 3600),
             )?;
-            conn.execute(
-                "DELETE FROM process_samples WHERE ts<?",
-                [now - (raw_hours.min(12) as i64 * 3600)],
-            )?;
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
-            conn.execute_batch("PRAGMA incremental_vacuum(2048)")?;
+            reclaim_pages(&conn, 512)?;
             bytes = self.database_size_bytes();
         }
+
+        if bytes.saturating_mul(100) > budget.saturating_mul(95) {
+            pressure_stage = "compact-history";
+            rows_pruned += delete_batch_before(
+                &conn,
+                "process_samples",
+                "ts,proc_key",
+                "ts<?1",
+                "ts,proc_key",
+                now - (process_history_hours.min(6) as i64 * 3600),
+            )?;
+            rows_pruned += delete_batch_before(
+                &conn,
+                "minute_points",
+                "ts,name",
+                "name LIKE 'workload::%' AND ts<?1",
+                "ts,name",
+                now - 48 * 3600,
+            )?;
+            rows_pruned += delete_batch_before(
+                &conn,
+                "minute_points",
+                "ts,name",
+                "ts<?1 AND name NOT IN ('cpu','memory_used_percent','memory_available_percent','swap_used_percent','load_1m','cpu_pressure','memory_pressure','io_pressure','disk_used_percent','cpu_temperature_c')",
+                "ts,name",
+                now - 5 * 86400,
+            )?;
+            rows_pruned += delete_batch_before(
+                &conn,
+                "quarter_points",
+                "ts,name",
+                "ts<?1",
+                "ts,name",
+                now - 90 * 86400,
+            )?;
+            reclaim_pages(&conn, 1024)?;
+            bytes = self.database_size_bytes();
+        }
+
         if bytes > budget {
+            pressure_stage = "recent-metrics-only";
             let raw_cutoff = now - (raw_hours.min(6) as i64 * 3600);
-            conn.execute("DELETE FROM process_samples WHERE ts<?", [raw_cutoff])?;
-            conn.execute("DELETE FROM host_samples WHERE ts<?", [raw_cutoff])?;
-            conn.execute("DELETE FROM metric_points WHERE ts<?", [raw_cutoff])?;
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
-            conn.execute_batch("PRAGMA incremental_vacuum(4096)")?;
+            rows_pruned += delete_batch_before(
+                &conn,
+                "process_samples",
+                "ts,proc_key",
+                "ts<?1",
+                "ts,proc_key",
+                raw_cutoff,
+            )?;
+            rows_pruned +=
+                delete_batch_before(&conn, "host_samples", "ts", "ts<?1", "ts", raw_cutoff)?;
+            rows_pruned += delete_batch_before(
+                &conn,
+                "metric_points",
+                "ts,name",
+                "ts<?1",
+                "ts,name",
+                raw_cutoff,
+            )?;
+            rows_pruned += delete_batch_before(
+                &conn,
+                "process_lifecycle_events",
+                "id",
+                "ts<?1",
+                "ts,id",
+                now - 24 * 3600,
+            )?;
+            rows_pruned += delete_batch_before(
+                &conn,
+                "minute_points",
+                "ts,name",
+                "ts<?1 AND name IN ('cpu','memory_used_percent','memory_available_percent','swap_used_percent','load_1m','cpu_pressure','memory_pressure','io_pressure','disk_used_percent','cpu_temperature_c')",
+                "ts,name",
+                now - 7 * 86400,
+            )?;
+            rows_pruned += delete_batch_before(
+                &conn,
+                "minute_points",
+                "ts,name",
+                "ts<?1 AND name NOT IN ('cpu','memory_used_percent','memory_available_percent','swap_used_percent','load_1m','cpu_pressure','memory_pressure','io_pressure','disk_used_percent','cpu_temperature_c')",
+                "ts,name",
+                now - 48 * 3600,
+            )?;
+            rows_pruned += delete_batch_before(
+                &conn,
+                "quarter_points",
+                "ts,name",
+                "ts<?1",
+                "ts,name",
+                now - 60 * 86400,
+            )?;
+            reclaim_pages(&conn, 2048)?;
             bytes = self.database_size_bytes();
         }
+
         if bytes > budget {
-            conn.execute("DELETE FROM minute_points WHERE ts<?", [now - 14 * 86400])?;
-            conn.execute("DELETE FROM quarter_points WHERE ts<?", [now - 180 * 86400])?;
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
-            conn.execute_batch("PRAGMA incremental_vacuum(8192)")?;
+            pressure_stage = "minimum-history";
+            let raw_cutoff = now - 3600;
+            rows_pruned += delete_batch_before(
+                &conn,
+                "process_samples",
+                "ts,proc_key",
+                "ts<?1",
+                "ts,proc_key",
+                raw_cutoff,
+            )?;
+            rows_pruned +=
+                delete_batch_before(&conn, "host_samples", "ts", "ts<?1", "ts", raw_cutoff)?;
+            rows_pruned += delete_batch_before(
+                &conn,
+                "metric_points",
+                "ts,name",
+                "ts<?1",
+                "ts,name",
+                raw_cutoff,
+            )?;
+            rows_pruned += delete_batch_before(
+                &conn,
+                "process_lifecycle_events",
+                "id",
+                "ts<?1",
+                "ts,id",
+                now - 6 * 3600,
+            )?;
+            rows_pruned += delete_batch_before(
+                &conn,
+                "minute_points",
+                "ts,name",
+                "ts<?1",
+                "ts,name",
+                now - 24 * 3600,
+            )?;
+            rows_pruned += delete_batch_before(
+                &conn,
+                "quarter_points",
+                "ts,name",
+                "ts<?1",
+                "ts,name",
+                now - 30 * 86400,
+            )?;
+            rows_pruned +=
+                delete_batch_before(&conn, "anomalies", "id", "ts<?1", "ts,id", now - 7 * 86400)?;
+            reclaim_pages(&conn, 4096)?;
+            bytes = self.database_size_bytes();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
-        conn.execute_batch("PRAGMA incremental_vacuum(512)")?;
-        Ok(self.database_size_bytes())
+
+        let over_budget = bytes > budget;
+        let degraded = bytes.saturating_mul(100) > budget.saturating_mul(85);
+        let should_recover = bytes.saturating_mul(100) < budget.saturating_mul(75);
+        if degraded {
+            self.history_degraded.store(true, Ordering::Relaxed);
+        } else if should_recover {
+            self.history_degraded.store(false, Ordering::Relaxed);
+        }
+        Ok(DatabaseCleanupReport {
+            size_bytes: bytes,
+            budget_bytes: budget,
+            pressure_stage: pressure_stage.into(),
+            pressure_rows_pruned: rows_pruned,
+            over_budget,
+        })
+    }
+
+    pub fn history_degraded(&self) -> bool {
+        self.history_degraded.load(Ordering::Relaxed)
+    }
+
+    pub fn raw_retention(&self) -> anyhow::Result<RawRetention> {
+        let conn = self.lock()?;
+        let oldest = |sql: &str| -> anyhow::Result<Option<i64>> {
+            conn.query_row(sql, [], |row| row.get(0))
+                .map_err(Into::into)
+        };
+        Ok(RawRetention {
+            host_samples_oldest_at: oldest("SELECT min(ts) FROM host_samples")?,
+            process_samples_oldest_at: oldest("SELECT min(ts) FROM process_samples")?,
+            metric_points_oldest_at: oldest("SELECT min(ts) FROM metric_points")?,
+        })
     }
 
     pub fn integrity_check(&self) -> anyhow::Result<String> {
         Ok(self
             .lock()?
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))?)
+    }
+
+    pub fn checkpoint(&self) -> anyhow::Result<()> {
+        let connection = self.lock()?;
+        checkpoint_wal(&connection, "TRUNCATE", true)
     }
     pub fn count(&self, table: &str) -> anyhow::Result<i64> {
         let sql = match table {
@@ -855,17 +1170,51 @@ impl Store {
         Ok(self.lock()?.query_row(sql, [], |r| r.get(0))?)
     }
     pub fn database_size_bytes(&self) -> u64 {
-        let mut size = std::fs::metadata(self.path()).map(|m| m.len()).unwrap_or(0);
-        for suffix in ["-wal", "-shm", "-journal"] {
+        self.database_file_sizes().total_bytes
+    }
+
+    pub fn database_file_sizes(&self) -> DatabaseFileSizes {
+        let size_for = |suffix: &str| {
             let mut sidecar = self.path().as_os_str().to_os_string();
-            sidecar.push(suffix);
-            size = size.saturating_add(
-                std::fs::metadata(PathBuf::from(sidecar))
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0),
-            );
+            if !suffix.is_empty() {
+                sidecar.push(suffix);
+            }
+            std::fs::metadata(PathBuf::from(sidecar))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        };
+        let main_bytes = size_for("");
+        let wal_bytes = size_for("-wal");
+        let shm_bytes = size_for("-shm");
+        let journal_bytes = size_for("-journal");
+        DatabaseFileSizes {
+            main_bytes,
+            wal_bytes,
+            shm_bytes,
+            journal_bytes,
+            total_bytes: main_bytes
+                .saturating_add(wal_bytes)
+                .saturating_add(shm_bytes)
+                .saturating_add(journal_bytes),
         }
-        size
+    }
+
+    pub fn database_object_sizes(&self) -> anyhow::Result<Vec<DatabaseObjectSize>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT schema.name,schema.type,coalesce(sum(stat.pgsize),0)
+             FROM sqlite_schema AS schema LEFT JOIN dbstat AS stat ON stat.name=schema.name
+             WHERE schema.type IN ('table','index')
+             GROUP BY schema.name,schema.type ORDER BY sum(stat.pgsize) DESC,schema.name",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(DatabaseObjectSize {
+                name: row.get(0)?,
+                kind: row.get(1)?,
+                bytes: row.get::<_, i64>(2)?.max(0) as u64,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn account_hash(&self, username: &str) -> anyhow::Result<Option<String>> {
@@ -1039,6 +1388,66 @@ impl Store {
         Ok(())
     }
 }
+
+const PRESSURE_PRUNE_BATCH: usize = 20_000;
+
+/// Pressure pruning is deliberately split into deterministic oldest-first batches.
+/// Table and predicate fragments are internal constants at every call site.
+fn delete_batch_before(
+    connection: &Connection,
+    table: &str,
+    key: &str,
+    predicate: &str,
+    order_by: &str,
+    cutoff: i64,
+) -> anyhow::Result<u64> {
+    let delete_key = if key.contains(',') {
+        format!("({key})")
+    } else {
+        key.to_string()
+    };
+    let sql = format!(
+        "DELETE FROM {table} WHERE {delete_key} IN (SELECT {key} FROM {table} WHERE {predicate} ORDER BY {order_by} LIMIT ?2)"
+    );
+    Ok(connection.execute(&sql, params![cutoff, PRESSURE_PRUNE_BATCH as i64])? as u64)
+}
+
+fn checkpoint_wal(
+    connection: &Connection,
+    mode: &str,
+    require_complete: bool,
+) -> anyhow::Result<()> {
+    let sql = format!("PRAGMA wal_checkpoint({mode})");
+    let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+        connection.query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    let incomplete = busy != 0
+        || (log_frames >= 0 && checkpointed_frames >= 0 && checkpointed_frames < log_frames);
+    if incomplete {
+        if require_complete {
+            anyhow::bail!(
+                "SQLite WAL checkpoint incomplete: busy={busy}, log_frames={log_frames}, checkpointed_frames={checkpointed_frames}"
+            );
+        }
+        tracing::warn!(
+            busy,
+            log_frames,
+            checkpointed_frames,
+            "SQLite WAL checkpoint did not process every frame"
+        );
+    }
+    Ok(())
+}
+
+fn reclaim_pages(connection: &Connection, vacuum_pages: u64) -> anyhow::Result<()> {
+    checkpoint_wal(connection, "TRUNCATE", false)?;
+    connection.execute_batch(&format!(
+        "PRAGMA incremental_vacuum({})",
+        vacuum_pages.min(i64::MAX as u64)
+    ))?;
+    checkpoint_wal(connection, "TRUNCATE", false)?;
+    Ok(())
+}
+
 fn to_sql_i64(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
@@ -1302,6 +1711,52 @@ mod tests {
             .unwrap();
         assert_eq!(signature, "");
     }
+
+    #[test]
+    fn migration_adds_rollup_extrema_without_losing_legacy_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-rollups.sqlite");
+        let now = unix_now();
+        let old_sample = now - 40 * 86400;
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE minute_points(ts INTEGER NOT NULL,name TEXT NOT NULL,value REAL NOT NULL,PRIMARY KEY(ts,name)) WITHOUT ROWID;
+                 CREATE INDEX minute_points_lookup ON minute_points(name,ts);
+                 CREATE TABLE quarter_points(ts INTEGER NOT NULL,name TEXT NOT NULL,value REAL NOT NULL,PRIMARY KEY(ts,name)) WITHOUT ROWID;
+                 CREATE INDEX quarter_points_lookup ON quarter_points(name,ts);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO minute_points(ts,name,value) VALUES(?,'cpu',42.0)",
+                [old_sample],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO quarter_points(ts,name,value) VALUES(?,'cpu',37.0)",
+                [old_sample],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let chart = store.chart("cpu", old_sample, 20).unwrap();
+        assert_eq!(chart, vec![[old_sample as f64, 37.0, 37.0, 37.0]]);
+        {
+            let conn = store.lock().unwrap();
+            let row: (f64, Option<f64>, Option<f64>) = conn
+                .query_row(
+                    "SELECT value,min_value,max_value FROM minute_points WHERE ts=? AND name='cpu'",
+                    [old_sample],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(row, (42.0, None, None));
+        }
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.integrity_check().unwrap(), "ok");
+        reopened.checkpoint().unwrap();
+    }
     #[test]
     fn baseline_reset_versions_model_without_deleting_history() {
         let dir = tempfile::tempdir().unwrap();
@@ -1381,12 +1836,305 @@ mod tests {
         assert_eq!(s.latest_snapshot().unwrap().unwrap().cpu_percent, 12.5);
         assert_eq!(
             s.chart("cpu", h.timestamp - 1, 100).unwrap(),
-            vec![[h.timestamp as f64, 12.5]]
+            vec![[h.timestamp as f64, 12.5, 12.5, 12.5]]
         );
         assert_eq!(
             s.chart("disk_read_iops", h.timestamp - 1, 100).unwrap(),
-            vec![[h.timestamp as f64, 12.0]]
+            vec![[h.timestamp as f64, 12.0, 12.0, 12.0]]
         );
+    }
+
+    #[test]
+    fn database_size_accounting_includes_sidecars_and_dbstat_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sizes.sqlite")).unwrap();
+        let files = store.database_file_sizes();
+        assert_eq!(
+            files.total_bytes,
+            files.main_bytes + files.wal_bytes + files.shm_bytes + files.journal_bytes
+        );
+        let objects = store.database_object_sizes().unwrap();
+        assert!(objects.iter().any(|object| object.name == "host_samples"));
+        assert!(
+            objects
+                .iter()
+                .any(|object| object.name == "metric_points_lookup")
+        );
+        assert!(objects.iter().all(|object| object.bytes > 0));
+    }
+
+    #[test]
+    fn accelerated_raw_and_process_retention_keep_their_documented_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("accelerated-retention.sqlite")).unwrap();
+        let now = 1_900_000_000_i64;
+        let stale_raw = now - 49 * 3600;
+        let recent_raw = now - 47 * 3600;
+        let stale_process = now - 25 * 3600;
+        let recent_process = now - 23 * 3600;
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO host_samples(ts,payload) VALUES(?, 'old'),(?, 'recent')",
+                params![stale_raw, recent_raw],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO metric_points(ts,name,value) VALUES(?, 'cpu', 1.0),(?, 'cpu', 2.0)",
+                params![stale_raw, recent_raw],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO process_samples(ts,proc_key,pid,ppid,uid,name,executable,state,start_ticks,runtime_seconds,cpu_percent,rss_bytes,virtual_bytes,process_group,session,cgroup,workload,parent_disappeared) VALUES(?, 'old',1,1,1,'worker',NULL,'S',1,1,0.0,0,0,1,1,NULL,'worker',1),(?, 'recent',2,1,1,'worker',NULL,'S',2,1,0.0,0,0,1,1,NULL,'worker',1)",
+                params![stale_process, recent_process],
+            )
+            .unwrap();
+        }
+        let report = store.cleanup(now, 48, 500).unwrap();
+        assert_eq!(report.pressure_stage, "normal");
+        let conn = store.lock().unwrap();
+        for table in ["host_samples", "metric_points"] {
+            let oldest: i64 = conn
+                .query_row(&format!("SELECT min(ts) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let newest: i64 = conn
+                .query_row(&format!("SELECT max(ts) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                oldest, recent_raw,
+                "{table} retained a stale raw observation"
+            );
+            assert_eq!(newest, recent_raw, "{table} lost the in-window observation");
+        }
+        let process_times: Vec<i64> = conn
+            .prepare("SELECT ts FROM process_samples ORDER BY ts")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(process_times, vec![recent_process]);
+    }
+
+    #[test]
+    fn pressure_stage_is_deterministic_and_prunes_process_detail_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("pressure-stage.sqlite")).unwrap();
+        let now = 1_900_000_000_i64;
+        let budget_bytes = 1024 * 1024;
+        let host_payload = "h".repeat(700);
+        let mut host_id = 0_i64;
+        while store.database_size_bytes() < budget_bytes * 78 / 100 {
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO host_samples(ts,payload) VALUES(?,?)",
+                    params![now - 3600 + host_id, host_payload],
+                )
+                .unwrap();
+            host_id += 1;
+        }
+        let process_payload = "p".repeat(160);
+        let mut process_id = 0_i64;
+        while store.database_size_bytes() < budget_bytes * 92 / 100 {
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO process_samples(ts,proc_key,pid,ppid,uid,name,executable,state,start_ticks,runtime_seconds,cpu_percent,rss_bytes,virtual_bytes,process_group,session,cgroup,workload,parent_disappeared) VALUES(?, ?,1,1,1,?,NULL,'S',1,1,0.0,0,0,1,1,NULL,'worker',0)",
+                    params![now - 18 * 3600, format!("synthetic-{process_id}"), process_payload],
+                )
+                .unwrap();
+            process_id += 1;
+        }
+        let before = store.database_size_bytes();
+        assert!(before > budget_bytes * 90 / 100 && before <= budget_bytes * 95 / 100);
+        assert!(process_id > 0);
+
+        let report = store.cleanup(now, 48, 1).unwrap();
+        assert_eq!(report.pressure_stage, "process-history-12h");
+        assert!(!report.over_budget);
+        assert!(report.pressure_rows_pruned > 0);
+        assert!(report.pressure_rows_pruned <= PRESSURE_PRUNE_BATCH as u64);
+        assert_eq!(store.count("process_samples").unwrap(), 0);
+        assert!(store.count("host_samples").unwrap() > 0);
+        assert!(!store.history_degraded());
+    }
+
+    #[test]
+    fn pressure_delete_batches_are_oldest_first_and_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("bounded-prune.sqlite")).unwrap();
+        {
+            let conn = store.lock().unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            for index in 0..=PRESSURE_PRUNE_BATCH {
+                tx.execute(
+                    "INSERT INTO metric_points(ts,name,value) VALUES(1,?,1.0)",
+                    [format!("metric-{index:05}")],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let conn = store.lock().unwrap();
+        let pruned =
+            delete_batch_before(&conn, "metric_points", "ts,name", "ts<?1", "ts,name", 2).unwrap();
+        assert_eq!(pruned, PRESSURE_PRUNE_BATCH as u64);
+        let remaining: (i64, String) = conn
+            .query_row("SELECT ts,name FROM metric_points", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            remaining,
+            (1, format!("metric-{:05}", PRESSURE_PRUNE_BATCH))
+        );
+    }
+
+    #[test]
+    fn minute_and_quarter_rollups_preserve_observed_minimum_and_peak() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("rollup-extrema.sqlite")).unwrap();
+        let now = unix_now();
+        let quarter_end = now.div_euclid(900) * 900;
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO minute_points(ts,name,value,min_value,max_value) VALUES(?, 'cpu', 50.0, 45.0, 55.0)",
+                [quarter_end - 120],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO metric_points(ts,name,value) VALUES(?, 'cpu',10.0),(?, 'cpu',90.0),(?, 'cpu',20.0)",
+                params![quarter_end - 55, quarter_end - 35, quarter_end - 5],
+            )
+            .unwrap();
+        }
+        store.aggregate_until(quarter_end).unwrap();
+        let conn = store.lock().unwrap();
+        let minute: (f64, f64, f64) = conn
+            .query_row(
+                "SELECT value,min_value,max_value FROM minute_points WHERE ts=? AND name='cpu'",
+                [quarter_end - 60],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(minute, (40.0, 10.0, 90.0));
+        let quarter: (f64, f64, f64) = conn
+            .query_row(
+                "SELECT value,min_value,max_value FROM quarter_points WHERE ts=? AND name='cpu'",
+                [quarter_end - 900],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(quarter, (45.0, 10.0, 90.0));
+    }
+
+    #[test]
+    fn process_history_sampling_is_bounded_even_with_many_parent_loss_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("process-cap.sqlite")).unwrap();
+        let processes = (0..150_u32)
+            .map(|pid| ProcessSnapshot {
+                key: format!("boot:{pid}:1"),
+                pid,
+                ppid: 1,
+                uid: 1000,
+                name: format!("worker-{pid}"),
+                executable: None,
+                state: "S".into(),
+                start_ticks: 1,
+                runtime_seconds: 60,
+                cpu_percent: pid as f64,
+                rss_bytes: pid as u64 * 1024,
+                virtual_bytes: 0,
+                process_group: 1,
+                session: 1,
+                cgroup: None,
+                workload: "worker.service".into(),
+                parent_disappeared: true,
+            })
+            .collect::<Vec<_>>();
+        store.save_processes(unix_now(), &processes).unwrap();
+        let count = store.count("process_samples").unwrap();
+        assert!(count <= 50);
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn synthetic_budget_pressure_sheds_old_detail_and_keeps_incident_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("budget-pressure.sqlite")).unwrap();
+        let now = 1_900_000_000_i64;
+        let payload = "x".repeat(2048);
+        {
+            let conn = store.lock().unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            for index in 0..1500_i64 {
+                tx.execute(
+                    "INSERT INTO host_samples(ts,payload) VALUES(?,?)",
+                    params![now - 7 * 3600 + index, payload],
+                )
+                .unwrap();
+            }
+            tx.execute(
+                "INSERT INTO host_samples(ts,payload) VALUES(?, 'recent')",
+                [now - 5 * 60],
+            )
+            .unwrap();
+            for index in 1..=600_i64 {
+                tx.execute(
+                    "INSERT INTO host_samples(ts,payload) VALUES(?,?)",
+                    params![now - 5 * 60 + index, payload],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        store
+            .open_or_update_incident(
+                "synthetic-active",
+                "critical",
+                "Synthetic active incident",
+                0.99,
+                &serde_json::json!({"preserve": "evidence"}),
+                "test evidence",
+                now - 10,
+            )
+            .unwrap();
+
+        let report = store.cleanup(now, 48, 1).unwrap();
+        assert_eq!(report.pressure_stage, "minimum-history");
+        assert!(report.over_budget);
+        assert!(report.pressure_rows_pruned <= PRESSURE_PRUNE_BATCH as u64 * 20);
+        assert!(store.history_degraded());
+        assert_eq!(
+            store.incidents(true, 10).unwrap()[0].signature,
+            "synthetic-active"
+        );
+        assert_eq!(
+            store.incidents(true, 10).unwrap()[0].evidence["preserve"],
+            "evidence"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM host_samples WHERE ts=?",
+                    [now - 5 * 60],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert!(report.size_bytes >= store.database_file_sizes().total_bytes);
     }
 
     #[test]

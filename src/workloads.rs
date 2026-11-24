@@ -12,9 +12,10 @@ pub fn group(processes: &[ProcessSnapshot]) -> BTreeMap<String, Vec<&ProcessSnap
     groups
 }
 
-/// Build bounded, stable metric names for the 25 busiest workload groups by CPU,
-/// memory, and process population. Names contain a readable percent-encoded
-/// label plus a stable hash.
+/// Build bounded, stable metric names for the eight busiest workload groups by
+/// CPU, memory, and process population. Names contain a readable percent-encoded
+/// label plus a stable hash. The limit matches the number of workload rows shown
+/// in the overview and bounds the amount of history created by transient scopes.
 pub fn baseline_metrics(processes: &[ProcessSnapshot]) -> Vec<(String, f64)> {
     let aggregates = group(processes)
         .into_iter()
@@ -31,9 +32,9 @@ pub fn baseline_metrics(processes: &[ProcessSnapshot]) -> Vec<(String, f64)> {
     let mut by_population = aggregates.clone();
     by_population.sort_by_key(|item| std::cmp::Reverse(item.3));
     let mut selected = HashSet::new();
-    selected.extend(by_cpu.into_iter().take(25).map(|item| item.0));
-    selected.extend(by_memory.into_iter().take(25).map(|item| item.0));
-    selected.extend(by_population.into_iter().take(25).map(|item| item.0));
+    selected.extend(by_cpu.into_iter().take(8).map(|item| item.0));
+    selected.extend(by_memory.into_iter().take(8).map(|item| item.0));
+    selected.extend(by_population.into_iter().take(8).map(|item| item.0));
 
     let values = aggregates
         .into_iter()

@@ -69,7 +69,7 @@ describe("Sentinel application", () => {
       notification_enabled: false, notification_provider: "ntfy", notification_configured: false,
       ai_enabled: false, ai_provider: "ollama", ai_configured: false, interface: "tailscale0", port: 8765, config_path: "/home/test/.config/sentinel/config.toml",
     });
-    apiMocks.notificationHistory.mockResolvedValue({ notifications: [] });
+    apiMocks.notificationHistory.mockResolvedValue({ notifications: [], delivery_health: { worker_available: true, queue_depth: 0, dropped_jobs: 0, failed_deliveries: 0, consecutive_failures: 0, last_failure_at: null, last_failure_detail: null } });
   });
 
   it("renders a live overview with real host state and navigates to performance", async () => {
@@ -80,6 +80,25 @@ describe("Sentinel application", () => {
     fireEvent.click(screen.getByRole("button", { name: "Performance" }));
     expect(await screen.findByRole("heading", { name: "Performance" })).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Total CPU utilization" })).toBeInTheDocument();
+  });
+
+  it("shows safe notification delivery failures in Settings", async () => {
+    apiMocks.config.mockResolvedValueOnce({
+      host_seconds: 5, process_seconds: 10, hardware_seconds: 15, service_seconds: 60,
+      retention_hours: 48, database_budget_mb: 500,
+      thresholds: { memory_available_warning_percent: 8, memory_available_critical_percent: 3, disk_used_warning_percent: 95, cpu_pressure_warning_percent: 20, memory_pressure_warning_percent: 10 },
+      notification_enabled: true, notification_provider: "ntfy", notification_configured: true,
+      ai_enabled: false, ai_provider: "ollama", ai_configured: false, interface: "tailscale0", port: 8765, config_path: "/home/test/.config/sentinel/config.toml",
+    });
+    apiMocks.notificationHistory.mockResolvedValueOnce({
+      notifications: [{ id: 1, incident_id: 2, timestamp: host.timestamp, provider: "ntfy", status: "failed", detail: "provider returned HTTP 401" }],
+      delivery_health: { worker_available: true, queue_depth: 0, dropped_jobs: 0, failed_deliveries: 1, consecutive_failures: 1, last_failure_at: host.timestamp, last_failure_detail: "Notification delivery failed: provider returned HTTP 401." },
+    });
+    render(<App />);
+    await screen.findByRole("heading", { name: "Overview" });
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(await screen.findByText(/1 consecutive delivery failures/)).toBeInTheDocument();
+    expect(screen.getByText(/Notification delivery failed: provider returned HTTP 401/)).toBeInTheDocument();
   });
 
   it("opens a selected process inspector with observed identity and parent information", async () => {

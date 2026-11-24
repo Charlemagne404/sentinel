@@ -4,7 +4,7 @@ use crate::{
     notifications::IncidentNotice,
     storage::{Baseline, SeasonalValues, Store},
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 #[derive(Default)]
 pub struct Evaluator {
@@ -12,6 +12,23 @@ pub struct Evaluator {
     misses: HashMap<String, u8>,
     baseline_version: Option<u32>,
     seasonal_cache: HashMap<String, (i64, i64, i64, Option<SeasonalValues>)>,
+    browser_history: HashMap<String, VecDeque<BrowserSample>>,
+}
+
+#[derive(Clone)]
+struct BrowserSample {
+    timestamp: i64,
+    identities: HashSet<String>,
+    count: usize,
+    rss_bytes: u64,
+}
+
+#[derive(Clone)]
+struct BrowserGrowth {
+    previous_count: usize,
+    window_seconds: i64,
+    new_processes: usize,
+    rss_increase_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +87,74 @@ impl Evaluator {
             self.seasonal_cache.remove(&oldest);
         }
         Ok(model)
+    }
+
+    fn observe_browser_population(
+        &mut self,
+        workload: &str,
+        members: &[&ProcessSnapshot],
+        now: i64,
+    ) -> Option<BrowserGrowth> {
+        let cutoff = now.saturating_sub(30 * 60);
+        for history in self.browser_history.values_mut() {
+            while history
+                .front()
+                .is_some_and(|sample| sample.timestamp < cutoff)
+            {
+                history.pop_front();
+            }
+        }
+        self.browser_history
+            .retain(|_, history| !history.is_empty());
+        if !self.browser_history.contains_key(workload) && self.browser_history.len() >= 64 {
+            let oldest = self
+                .browser_history
+                .iter()
+                .min_by_key(|(_, history)| history.back().map(|sample| sample.timestamp))
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.browser_history.remove(&oldest);
+            }
+        }
+
+        let sample = BrowserSample {
+            timestamp: now,
+            identities: members
+                .iter()
+                .take(200)
+                .map(|process| process.key.clone())
+                .collect(),
+            count: members.len(),
+            rss_bytes: members
+                .iter()
+                .map(|process| process.rss_bytes)
+                .fold(0_u64, u64::saturating_add),
+        };
+        let history = self
+            .browser_history
+            .entry(workload.to_string())
+            .or_default();
+        if history
+            .back()
+            .is_some_and(|previous| previous.timestamp == now)
+        {
+            history.pop_back();
+        }
+        history.push_back(sample.clone());
+        while history.len() > 31 {
+            history.pop_front();
+        }
+        let previous = history.iter().rev().skip(1).find(|previous| {
+            let age = now.saturating_sub(previous.timestamp);
+            (10 * 60..=20 * 60).contains(&age)
+        })?;
+        let new_processes = sample.identities.difference(&previous.identities).count();
+        Some(BrowserGrowth {
+            previous_count: previous.count,
+            window_seconds: now.saturating_sub(previous.timestamp),
+            new_processes,
+            rss_increase_bytes: sample.rss_bytes.saturating_sub(previous.rss_bytes),
+        })
     }
 
     pub fn evaluate(
@@ -265,7 +350,13 @@ impl Evaluator {
                 score >= 4.5 && seasonal_score.is_none_or(|seasonal_score| seasonal_score >= 3.5);
             let seasonal_candidate =
                 seasonal_score.is_some_and(|seasonal_score| seasonal_score >= 4.5);
-            let is_candidate = mature && (rolling_candidate || seasonal_candidate || cusum >= 8.0);
+            let cpu_candidate_allowed = !is_cpu_utilization_metric(&metric)
+                || host
+                    .psi_cpu_some_percent
+                    .is_some_and(|value| value >= config.thresholds.cpu_pressure_warning_percent);
+            let is_candidate = mature
+                && cpu_candidate_allowed
+                && (rolling_candidate || seasonal_candidate || cusum >= 8.0);
             let streak = self.streaks.entry(metric.to_string()).or_default();
             *streak = next_candidate_streak(*streak, is_candidate);
             if mature && *streak >= 3 {
@@ -347,22 +438,59 @@ impl Evaluator {
             }
         }
 
-        let browsers = processes
+        let mut browser_workloads = BTreeMap::<String, Vec<&ProcessSnapshot>>::new();
+        for process in processes
             .iter()
             .filter(|p| p.parent_disappeared && p.runtime_seconds > 60 && is_browser(&p.name))
-            .collect::<Vec<_>>();
+        {
+            browser_workloads
+                .entry(process.workload.clone())
+                .or_default()
+                .push(process);
+        }
+        let mut browsers = Vec::<&ProcessSnapshot>::new();
+        let mut browser_growth = Vec::<serde_json::Value>::new();
+        let active_browser_incident = active_incidents
+            .iter()
+            .any(|incident| incident.signature == "orphan-browser");
+        for (workload, members) in browser_workloads {
+            let cpu = members
+                .iter()
+                .map(|process| process.cpu_percent)
+                .sum::<f64>();
+            let rss = members.iter().map(|process| process.rss_bytes).sum::<u64>();
+            let Some(growth) = self.observe_browser_population(&workload, &members, now) else {
+                continue;
+            };
+            let population_modeled = members.iter().any(|process| {
+                let key = crate::workloads::workload_metric_key(&process.workload);
+                triggers.iter().any(|finding| {
+                    finding.kind == "statistical"
+                        && finding.metric.ends_with("::process_count")
+                        && workload_key_from_metric(&finding.metric) == Some(key.as_str())
+                })
+            });
+            let growing = (growth.new_processes >= 4
+                && growth.rss_increase_bytes >= 512 * 1024 * 1024)
+                || growth.rss_increase_bytes >= 1024 * 1024 * 1024
+                || growth.new_processes >= 8;
+            if !population_modeled
+                && browser_accumulation_suspicious(members.len(), cpu, rss)
+                && (growing || active_browser_incident)
+            {
+                browsers.extend(members.iter().copied());
+                browser_growth.push(serde_json::json!({
+                    "workload": workload,
+                    "previous_process_count": growth.previous_count,
+                    "new_processes": growth.new_processes,
+                    "window_seconds": growth.window_seconds,
+                    "rss_increase_bytes": growth.rss_increase_bytes
+                }));
+            }
+        }
         let browser_cpu = browsers.iter().map(|p| p.cpu_percent).sum::<f64>();
         let browser_rss = browsers.iter().map(|p| p.rss_bytes).sum::<u64>();
-        let browser_population_modeled = browsers.iter().any(|process| {
-            let key = crate::workloads::workload_metric_key(&process.workload);
-            triggers.iter().any(|finding| {
-                finding.kind == "statistical"
-                    && finding.metric.ends_with("::process_count")
-                    && workload_key_from_metric(&finding.metric) == Some(key.as_str())
-            })
-        });
-        let orphan_active = !browser_population_modeled
-            && browser_accumulation_suspicious(browsers.len(), browser_cpu, browser_rss);
+        let orphan_active = !browsers.is_empty();
         let resource = triggers
             .iter()
             .filter(|trigger| trigger.kind == "resource")
@@ -404,6 +532,7 @@ impl Evaluator {
                 "workloads": workloads,
                 "process_groups": groups,
                 "sessions": sessions,
+                "growth_windows": browser_growth,
                 "direct_fact": "previous parent identity disappeared between process observations",
                 "inference": "orphaned browser work is possible, but normal daemonization is also possible"
             });
@@ -885,6 +1014,17 @@ fn cusum_eligible_metric(metric: &str) -> bool {
         metric,
         "memory_used_percent" | "swap_used_percent" | "disk_used_percent"
     ) || metric.ends_with("::rss_bytes")
+}
+fn is_cpu_utilization_metric(metric: &str) -> bool {
+    matches!(
+        metric,
+        "cpu"
+            | "cpu_user_percent"
+            | "cpu_system_percent"
+            | "cpu_iowait_percent"
+            | "cpu_idle_percent"
+    ) || metric.starts_with("cpu_core_")
+        || (metric.starts_with("workload::") && metric.ends_with("::cpu_percent"))
 }
 fn cusum_score(observations: &[(i64, f64)], now: i64, current: f64, center: f64, mad: f64) -> f64 {
     let scale = (mad * 1.4826).max(center.abs() * 0.05).max(0.01);
@@ -1392,8 +1532,25 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let now = crate::storage::unix_now();
+        let mut evaluator = Evaluator::default();
+        let initial_population = processes.iter().take(4).cloned().collect::<Vec<_>>();
+        assert!(
+            evaluator
+                .evaluate(
+                    &store,
+                    &Config::default(),
+                    &HostSnapshot::default(),
+                    &initial_population,
+                    &[],
+                    0,
+                    &[],
+                    now - 600,
+                )
+                .unwrap()
+                .is_empty()
+        );
 
-        let findings = Evaluator::default()
+        let findings = evaluator
             .evaluate(
                 &store,
                 &Config::default(),
@@ -1469,6 +1626,22 @@ mod tests {
             .collect::<Vec<_>>();
         let mut evaluator = Evaluator::default();
         let now = crate::storage::unix_now();
+        let initial_population = processes.iter().take(4).cloned().collect::<Vec<_>>();
+        assert!(
+            evaluator
+                .evaluate(
+                    &store,
+                    &Config::default(),
+                    &HostSnapshot::default(),
+                    &initial_population,
+                    &[],
+                    0,
+                    &[],
+                    now - 600,
+                )
+                .unwrap()
+                .is_empty()
+        );
         let warning = evaluator
             .evaluate(
                 &store,
@@ -1532,6 +1705,120 @@ mod tests {
             .unwrap();
         assert!(steady.is_empty());
         assert_eq!(store.incidents(true, 10).unwrap()[0].severity, "critical");
+    }
+
+    #[test]
+    fn stable_browser_pool_is_quiet_but_observed_growth_is_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("browser-growth.sqlite")).unwrap();
+        let make_population = |count: u32| {
+            (0..count)
+                .map(|index| ProcessSnapshot {
+                    key: format!("boot:{}:50", index + 500),
+                    pid: index + 500,
+                    ppid: 1,
+                    uid: 1000,
+                    name: "chromium".into(),
+                    executable: Some("/usr/lib/chromium/chromium".into()),
+                    state: "S".into(),
+                    start_ticks: 50,
+                    runtime_seconds: 1800,
+                    cpu_percent: 1.0,
+                    rss_bytes: 256 * 1024 * 1024,
+                    virtual_bytes: 0,
+                    process_group: 1,
+                    session: 1,
+                    cgroup: Some("/user.slice/browser-pool.scope".into()),
+                    workload: "browser-pool.scope".into(),
+                    parent_disappeared: true,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut evaluator = Evaluator::default();
+        let now = crate::storage::unix_now().div_euclid(60) * 60;
+        let stable = make_population(8);
+        for minute in 0..4 {
+            let findings = evaluator
+                .evaluate(
+                    &store,
+                    &Config::default(),
+                    &HostSnapshot::default(),
+                    &stable,
+                    &[],
+                    0,
+                    &[],
+                    now - 1200 + minute * 600,
+                )
+                .unwrap();
+            assert!(findings.is_empty());
+        }
+        assert!(store.incidents(true, 10).unwrap().is_empty());
+
+        let growing = make_population(12);
+        let findings = evaluator
+            .evaluate(
+                &store,
+                &Config::default(),
+                &HostSnapshot::default(),
+                &growing,
+                &[],
+                0,
+                &[],
+                now + 1200,
+            )
+            .unwrap();
+        assert_eq!(findings.len(), 1);
+        let incident = store.incidents(true, 10).unwrap().remove(0);
+        assert_eq!(incident.signature, "orphan-browser");
+        assert_eq!(incident.evidence["growth_windows"][0]["new_processes"], 4);
+        assert_eq!(
+            incident.evidence["growth_windows"][0]["window_seconds"],
+            600
+        );
+        assert_eq!(
+            incident.evidence["growth_windows"][0]["rss_increase_bytes"],
+            1024_u64 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn sustained_cpu_work_window_does_not_alert_without_cpu_pressure() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("sustained-cpu.sqlite")).unwrap();
+        let now = crate::storage::unix_now().div_euclid(60) * 60;
+        let history = (1..=2880_i64)
+            .map(|minute| {
+                let timestamp = now - (2881 - minute) * 60;
+                let value = if minute.rem_euclid(60) < 10 {
+                    88.0
+                } else {
+                    60.0
+                };
+                (timestamp, "cpu", value)
+            })
+            .collect::<Vec<_>>();
+        store.seed_minute_points_for_test(&history).unwrap();
+        let mut evaluator = Evaluator::default();
+        for minute in 0..3 {
+            let findings = evaluator
+                .evaluate(
+                    &store,
+                    &Config::default(),
+                    &HostSnapshot {
+                        cpu_percent: 88.0,
+                        psi_cpu_some_percent: Some(0.2),
+                        ..HostSnapshot::default()
+                    },
+                    &[],
+                    &[],
+                    0,
+                    &[],
+                    now + minute * 60,
+                )
+                .unwrap();
+            assert!(findings.is_empty());
+        }
+        assert!(store.incidents(true, 10).unwrap().is_empty());
     }
 
     #[test]

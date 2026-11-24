@@ -108,9 +108,9 @@ impl Monitor {
             Instant::now() - Duration::from_secs(initial.collection.hardware_seconds);
         let mut last_service =
             Instant::now() - Duration::from_secs(initial.collection.service_seconds);
-        let mut last_history = Instant::now() - Duration::from_secs(30);
-        let mut last_cleanup = Instant::now();
-        let mut last_cleanup_defer = Instant::now();
+        let mut last_history = Instant::now() - Duration::from_secs(60);
+        let mut last_cleanup = Instant::now() - Duration::from_secs(15 * 60);
+        let mut last_cleanup_defer = Instant::now() - Duration::from_secs(300);
         let mut last_intel_bucket = 0_i64;
         let mut evaluator = crate::intelligence::Evaluator::default();
         let mut last_oom_kill_count = self
@@ -162,7 +162,12 @@ impl Monitor {
                             warn!(error=%e,"failed to persist process lifecycle events");
                             self.live.operational.write().await.database_write_failures += 1;
                         }
-                        if now.duration_since(last_history).as_secs() >= 30 {
+                        let history_interval = if self.store.history_degraded() {
+                            300
+                        } else {
+                            60
+                        };
+                        if now.duration_since(last_history).as_secs() >= history_interval {
                             if let Err(e) = self.store.save_processes(epoch, &collected) {
                                 warn!(error=%e,"failed to persist process sample");
                                 self.live.operational.write().await.database_write_failures += 1;
@@ -340,24 +345,61 @@ impl Monitor {
                     self.live.changed();
                 }
             }
-            if now.duration_since(last_cleanup).as_secs() >= 3600 {
-                if overloaded {
+            if now.duration_since(last_cleanup).as_secs() >= 15 * 60 {
+                let (main_database_budget_mb, _) =
+                    crate::config::database_budget_partitions_mb(config.server.database_budget_mb);
+                let main_database_budget_bytes =
+                    main_database_budget_mb.saturating_mul(1024 * 1024);
+                let should_defer_maintenance = if overloaded {
                     if now.duration_since(last_cleanup_defer).as_secs() >= 300 {
                         last_cleanup_defer = now;
-                        debug!("database maintenance deferred while host pressure is high");
+                        let under_pressure = self.store.database_size_bytes().saturating_mul(100)
+                            <= main_database_budget_bytes.saturating_mul(85);
+                        if under_pressure {
+                            debug!("database maintenance deferred while host pressure is high");
+                        }
+                        under_pressure
+                    } else {
+                        true
                     }
                 } else {
+                    false
+                };
+                if !should_defer_maintenance {
                     last_cleanup = now;
-                    let (main_database_budget_mb, _) = crate::config::database_budget_partitions_mb(
-                        config.server.database_budget_mb,
-                    );
+                    let cleanup_started = Instant::now();
                     match self.store.cleanup(
                         epoch,
                         config.collection.retention_hours,
                         main_database_budget_mb,
                     ) {
-                        Ok(size) => debug!(database_bytes = size, "retention complete"),
-                        Err(e) => warn!(error=%e,"retention maintenance failed"),
+                        Ok(report) if report.over_budget => warn!(
+                            database_bytes = report.size_bytes,
+                            database_budget_bytes = report.budget_bytes,
+                            pressure_stage = %report.pressure_stage,
+                            pressure_rows_pruned = report.pressure_rows_pruned,
+                            duration_ms = cleanup_started.elapsed().as_secs_f64() * 1000.0,
+                            "database remains above its budget after retention; detailed history sampling is throttled while monitoring continues"
+                        ),
+                        Ok(report) if report.pressure_stage != "normal" => warn!(
+                            database_bytes = report.size_bytes,
+                            database_budget_bytes = report.budget_bytes,
+                            pressure_stage = %report.pressure_stage,
+                            pressure_rows_pruned = report.pressure_rows_pruned,
+                            duration_ms = cleanup_started.elapsed().as_secs_f64() * 1000.0,
+                            "database retention was shortened to remain within budget"
+                        ),
+                        Ok(report) => debug!(
+                            database_bytes = report.size_bytes,
+                            pressure_rows_pruned = report.pressure_rows_pruned,
+                            duration_ms = cleanup_started.elapsed().as_secs_f64() * 1000.0,
+                            "retention complete"
+                        ),
+                        Err(e) => warn!(
+                            error=%e,
+                            duration_ms = cleanup_started.elapsed().as_secs_f64() * 1000.0,
+                            "retention maintenance failed"
+                        ),
                     }
                 }
             }

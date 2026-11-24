@@ -283,19 +283,26 @@ async fn health_report(s: &AppState) -> serde_json::Value {
             .last_database_write_at
             .is_some_and(|timestamp| now.saturating_sub(timestamp).max(0) <= max_age);
     let database_size_bytes = s.store.database_size_bytes();
+    let database_files = s.store.database_file_sizes();
+    let database_objects = s.store.database_object_sizes();
+    let raw_retention = s.store.raw_retention().ok();
     let storage_history_bytes = s.storage_watch.history_database_size_bytes();
     let (main_database_budget_mb, storage_history_budget_mb) =
         crate::config::database_budget_partitions_mb(config.server.database_budget_mb);
     let total_database_size_bytes = database_size_bytes.saturating_add(storage_history_bytes);
     let database_budget_bytes = config.server.database_budget_mb.saturating_mul(1024 * 1024);
     let database_within_budget = total_database_size_bytes <= database_budget_bytes;
+    let notification_health = s.notifications.health();
+    let notifications_healthy = !config.notifications.enabled
+        || (notification_health.worker_available && notification_health.consecutive_failures == 0);
     let degraded = !(host_fresh
         && database_readable
         && database_write_fresh
         && database_within_budget
         && process_fresh
         && storage_healthy
-        && operational.service_inventory_complete);
+        && operational.service_inventory_complete
+        && notifications_healthy);
     let collector_gaps = latest
         .as_ref()
         .map(|snapshot| snapshot.collection_degraded.clone())
@@ -332,6 +339,11 @@ async fn health_report(s: &AppState) -> serde_json::Value {
             "last_write_at": operational.last_database_write_at,
             "write_latency_ms": operational.database_write_latency_ms,
             "size_bytes": database_size_bytes,
+            "files": database_files,
+            "objects": database_objects.as_ref().ok(),
+            "object_breakdown_error": database_objects.as_ref().err().map(ToString::to_string),
+            "raw_retention": raw_retention,
+            "history_sampling_degraded": s.store.history_degraded(),
             "storage_history_bytes": storage_history_bytes,
             "total_size_bytes": total_database_size_bytes,
             "budget_bytes": database_budget_bytes,
@@ -359,6 +371,7 @@ async fn health_report(s: &AppState) -> serde_json::Value {
             "missed_host_samples": operational.missed_host_samples,
             "notification_queue_depth": s.notifications.queue_depth(),
             "notification_dropped_jobs": s.notifications.dropped_jobs(),
+            "notifications": notification_health,
             "collector_failures": operational.process_collector_failures,
             "database_write_failures": operational.database_write_failures
         },
@@ -957,9 +970,10 @@ async fn services(State(s): State<AppState>) -> Json<serde_json::Value> {
 async fn notification_history(
     State(s): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(
-        serde_json::json!({"notifications":s.store.notifications(100).map_err(ApiError::internal)?}),
-    ))
+    Ok(Json(serde_json::json!({
+        "notifications": s.store.notifications(100).map_err(ApiError::internal)?,
+        "delivery_health": s.notifications.health(),
+    })))
 }
 async fn test_notification(State(s): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let config = s.config.read().await.clone();

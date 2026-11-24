@@ -257,7 +257,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.server.database_dir)?;
     let store = storage::Store::open(&config.database_path())?;
     let notifications = notifications::Dispatcher::start(store.clone());
-    let state = api::AppState::new(config.clone(), store.clone(), notifications)?;
+    let state = api::AppState::new(config.clone(), store.clone(), notifications.clone())?;
     let bind = config.listen_address();
     let listener = tokio::net::TcpListener::bind((bind.as_str(), config.server.port)).await?;
     let actual = listener.local_addr()?;
@@ -277,10 +277,14 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         result = axum::serve(listener, api::router(state).into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown) => result.map_err(anyhow::Error::from),
         result = monitor.run() => result,
     };
+    notifications.shutdown().await;
     let _ = shutdown_tx.send(true);
-    storage_task
+    let storage_result = storage_task
         .await
-        .map_err(|error| anyhow::anyhow!("storage task failed: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("storage task failed: {error}"));
+    let checkpoint_result = store.checkpoint();
+    storage_result?;
+    checkpoint_result?;
     service_result?;
     Ok(())
 }
@@ -289,8 +293,16 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate = signal(SignalKind::terminate()).expect("register SIGTERM handler");
-        tokio::select! {_ = tokio::signal::ctrl_c()=>{},_ = terminate.recv()=>{}}
+        let ctrl_c = tokio::signal::ctrl_c();
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {_ = ctrl_c=>{},_ = terminate.recv()=>{}}
+            }
+            Err(error) => {
+                tracing::warn!(error=%error,"could not register the SIGTERM handler; waiting for Ctrl-C");
+                let _ = ctrl_c.await;
+            }
+        }
     }
     #[cfg(not(unix))]
     {

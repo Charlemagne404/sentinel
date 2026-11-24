@@ -1,6 +1,6 @@
 import type {
   AiInvestigation, Baseline, HostSnapshot, Incident, Overview, ProcessSnapshot, PublicConfig,
-  ProcessLifecycleEvent, SeasonalBaseline, Series, ServiceSnapshot, StorageHistory, StorageReport, Workload,
+  NotificationDeliveryHealth, ProcessLifecycleEvent, SeasonalBaseline, Series, ServiceSnapshot, StorageHistory, StorageReport, Workload,
 } from "./types";
 
 let csrfToken: string | null = null;
@@ -100,7 +100,10 @@ export const api = {
   saveConfig: (patch: Partial<Pick<PublicConfig, "host_seconds" | "process_seconds" | "hardware_seconds" | "service_seconds" | "retention_hours" | "thresholds" | "notification_enabled" | "ai_enabled">>) =>
     request<PublicConfig>("/api/v1/config", { method: "PUT", body: JSON.stringify(patch) }),
   testNotification: () => request<{ ok: boolean; detail: string }>("/api/v1/notifications/test", { method: "POST", body: "{}" }),
-  notificationHistory: () => request<{ notifications: { id: number; incident_id: number | null; timestamp: number; provider: string; status: string; detail: string | null }[] }>("/api/v1/notifications"),
+  notificationHistory: () => request<{
+    notifications: { id: number; incident_id: number | null; timestamp: number; provider: string; status: string; detail: string | null }[];
+    delivery_health: NotificationDeliveryHealth;
+  }>("/api/v1/notifications"),
   authStatus: () => request<{ configured: boolean; setup_required: boolean; bootstrap_file?: string }>("/api/v1/auth/status"),
   health: () => request<{
     status: "ok" | "degraded";

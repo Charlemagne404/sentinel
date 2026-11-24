@@ -1,12 +1,12 @@
 use crate::{config::Config, storage::Store};
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 #[derive(Debug, Clone)]
 pub struct IncidentNotice {
@@ -22,6 +22,27 @@ pub struct IncidentNotice {
 pub struct Dispatcher {
     sender: mpsc::Sender<Job>,
     dropped_jobs: Arc<AtomicU64>,
+    health: Arc<DeliveryHealth>,
+    shutdown: watch::Sender<bool>,
+    worker: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NotificationHealth {
+    pub worker_available: bool,
+    pub queue_depth: usize,
+    pub dropped_jobs: u64,
+    pub failed_deliveries: u64,
+    pub consecutive_failures: u64,
+    pub last_failure_at: Option<i64>,
+    pub last_failure_detail: Option<String>,
+}
+
+struct DeliveryHealth {
+    worker_available: std::sync::atomic::AtomicBool,
+    failed_deliveries: AtomicU64,
+    consecutive_failures: AtomicU64,
+    last_failure: Mutex<Option<(i64, String)>>,
 }
 
 struct Job {
@@ -34,10 +55,42 @@ struct Job {
 impl Dispatcher {
     pub fn start(store: Store) -> Self {
         let (sender, receiver) = mpsc::channel(16);
-        tokio::spawn(worker(receiver, store));
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let health = Arc::new(DeliveryHealth {
+            worker_available: std::sync::atomic::AtomicBool::new(false),
+            failed_deliveries: AtomicU64::new(0),
+            consecutive_failures: AtomicU64::new(0),
+            last_failure: Mutex::new(None),
+        });
+        let worker = tokio::spawn(worker(receiver, store, health.clone(), shutdown_rx));
         Self {
             sender,
             dropped_jobs: Arc::new(AtomicU64::new(0)),
+            health,
+            shutdown,
+            worker: Arc::new(tokio::sync::Mutex::new(Some(worker))),
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown.send(true);
+        if let Some(mut worker) = self.worker.lock().await.take() {
+            match tokio::time::timeout(Duration::from_secs(10), &mut worker).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::error!(error=%error,"notification worker failed during shutdown");
+                }
+                Err(_) => {
+                    let queue_depth = self.queue_depth();
+                    self.health.worker_available.store(false, Ordering::Relaxed);
+                    tracing::warn!(
+                        queue_depth,
+                        "notification worker did not drain within the shutdown deadline; aborting it"
+                    );
+                    worker.abort();
+                    let _ = worker.await;
+                }
+            }
         }
     }
 
@@ -49,6 +102,24 @@ impl Dispatcher {
 
     pub fn dropped_jobs(&self) -> u64 {
         self.dropped_jobs.load(Ordering::Relaxed)
+    }
+
+    pub fn health(&self) -> NotificationHealth {
+        let last_failure = self
+            .health
+            .last_failure
+            .lock()
+            .ok()
+            .and_then(|failure| failure.clone());
+        NotificationHealth {
+            worker_available: self.health.worker_available.load(Ordering::Relaxed),
+            queue_depth: self.queue_depth(),
+            dropped_jobs: self.dropped_jobs(),
+            failed_deliveries: self.health.failed_deliveries.load(Ordering::Relaxed),
+            consecutive_failures: self.health.consecutive_failures.load(Ordering::Relaxed),
+            last_failure_at: last_failure.as_ref().map(|failure| failure.0),
+            last_failure_detail: last_failure.map(|failure| failure.1),
+        }
     }
 
     pub async fn notify(&self, config: &Config, notice: IncidentNotice) {
@@ -95,7 +166,12 @@ impl Dispatcher {
     }
 }
 
-async fn worker(mut receiver: mpsc::Receiver<Job>, store: Store) {
+async fn worker(
+    mut receiver: mpsc::Receiver<Job>,
+    store: Store,
+    health: Arc<DeliveryHealth>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
@@ -103,13 +179,50 @@ async fn worker(mut receiver: mpsc::Receiver<Job>, store: Store) {
         .build()
     {
         Ok(client) => Arc::new(client),
-        Err(_) => return,
-    };
-    while let Some(job) = receiver.recv().await {
-        let result = deliver(&client, &store, &job).await;
-        if let Some(reply) = job.reply {
-            let _ = reply.send(result);
+        Err(error) => {
+            tracing::error!(error=%error,"notification HTTP client initialization failed");
+            return;
         }
+    };
+    health.worker_available.store(true, Ordering::Relaxed);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    receiver.close();
+                    break;
+                }
+            }
+            job = receiver.recv() => {
+                let Some(job) = job else { break };
+                deliver_job(&client, &store, job, &health).await;
+            }
+        }
+    }
+    while let Some(job) = receiver.recv().await {
+        deliver_job(&client, &store, job, &health).await;
+    }
+    health.worker_available.store(false, Ordering::Relaxed);
+}
+
+async fn deliver_job(client: &reqwest::Client, store: &Store, job: Job, health: &DeliveryHealth) {
+    let result = deliver(client, store, &job).await;
+    if let Err(detail) = &result {
+        health.failed_deliveries.fetch_add(1, Ordering::Relaxed);
+        health.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            signature = %job.notice.signature,
+            detail = %detail,
+            "notification delivery failed"
+        );
+        if let Ok(mut last) = health.last_failure.lock() {
+            *last = Some((crate::storage::unix_now(), detail.clone()));
+        }
+    } else {
+        health.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+    if let Some(reply) = job.reply {
+        let _ = reply.send(result);
     }
 }
 
@@ -158,11 +271,19 @@ async fn deliver(client: &reqwest::Client, store: &Store, job: &Job) -> Result<S
         }
     }
 
-    let mut last_error = "provider request failed";
+    let mut last_failure = None::<ProviderFailure>;
+    let mut attempts = 0;
     for attempt in 1..=3 {
+        attempts = attempt;
         match send_provider(client, config, endpoint, &job.notice).await {
             Ok(()) => {
-                let detail = format!("delivered after {attempt} attempt(s)");
+                let detail = match &last_failure {
+                    Some(failure) => format!(
+                        "delivered after {attempt} attempts; recovered from {}",
+                        failure.detail
+                    ),
+                    None => format!("delivered after {attempt} attempt(s)"),
+                };
                 if store
                     .log_notification(
                         job.notice.incident_id,
@@ -184,22 +305,57 @@ async fn deliver(client: &reqwest::Client, store: &Store, job: &Job) -> Result<S
                     format!("Delivered via {provider}.")
                 });
             }
-            Err(reason) => last_error = reason,
-        }
-        if attempt < 3 {
-            tokio::time::sleep(Duration::from_millis(300 * (1 << (attempt - 1)))).await;
+            Err(failure) => {
+                let retryable = failure.retryable;
+                let retry_after = failure.retry_after;
+                last_failure = Some(failure);
+                if !retryable || attempt == 3 {
+                    break;
+                }
+                tokio::time::sleep(
+                    retry_after
+                        .unwrap_or_else(|| Duration::from_millis(300 * (1 << (attempt - 1)))),
+                )
+                .await;
+            }
         }
     }
-    let detail = format!("{last_error}; stopped after three attempts");
-    let _ = store.log_notification(
+    let failure = last_failure.unwrap_or_else(|| ProviderFailure {
+        detail: "provider request failed".into(),
+        retryable: false,
+        retry_after: None,
+    });
+    let detail = format!("{}; stopped after {attempts} attempt(s)", failure.detail);
+    if let Err(error) = store.log_notification(
         job.notice.incident_id,
         &job.notice.signature,
         now,
         provider,
         "failed",
         Some(&detail),
-    );
-    Err(format!("Notification delivery failed: {last_error}."))
+    ) {
+        tracing::warn!(error=%error,"failed to record notification delivery failure");
+    }
+    Err(format!("Notification delivery failed: {}.", failure.detail))
+}
+
+#[derive(Debug)]
+struct ProviderFailure {
+    detail: String,
+    retryable: bool,
+    retry_after: Option<Duration>,
+}
+
+fn provider_status_failure(
+    status: reqwest::StatusCode,
+    retry_after: Option<Duration>,
+) -> ProviderFailure {
+    let retryable = status.is_server_error() || status.as_u16() == 429;
+    ProviderFailure {
+        detail: format!("provider returned HTTP {}", status.as_u16()),
+        retryable,
+        retry_after: retryable.then_some(retry_after).flatten(),
+    }
 }
 
 async fn send_provider(
@@ -207,7 +363,7 @@ async fn send_provider(
     config: &crate::config::NotificationConfig,
     endpoint: &str,
     notice: &IncidentNotice,
-) -> Result<(), &'static str> {
+) -> Result<(), ProviderFailure> {
     let state = if notice.recovered {
         "recovered"
     } else if notice.escalated {
@@ -240,26 +396,39 @@ async fn send_provider(
         if let Some(secret) = config.secret.as_deref().filter(|s| !s.is_empty()) {
             request = request.bearer_auth(secret);
         }
-        request
-            .send()
-            .await
-            .map_err(|_| "provider connection failed")?
+        request.send().await.map_err(|_| ProviderFailure {
+            detail: "provider connection failed".into(),
+            retryable: true,
+            retry_after: None,
+        })?
     } else if config.provider == "discord" {
         client
             .post(endpoint)
             .json(&serde_json::json!({"content":body}))
             .send()
             .await
-            .map_err(|_| "provider connection failed")?
+            .map_err(|_| ProviderFailure {
+                detail: "provider connection failed".into(),
+                retryable: true,
+                retry_after: None,
+            })?
     } else {
-        return Err("unsupported provider");
+        return Err(ProviderFailure {
+            detail: "unsupported provider".into(),
+            retryable: false,
+            retry_after: None,
+        });
     };
     if response.status().is_success() {
         Ok(())
-    } else if response.status().is_server_error() || response.status().as_u16() == 429 {
-        Err("provider temporarily unavailable")
     } else {
-        Err("provider rejected the request")
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|seconds| Duration::from_secs(seconds.clamp(1, 10)));
+        Err(provider_status_failure(response.status(), retry_after))
     }
 }
 
@@ -292,20 +461,38 @@ fn fail(
     now: i64,
     detail: &str,
 ) -> Result<String, String> {
-    let _ = store.log_notification(
+    if let Err(error) = store.log_notification(
         job.notice.incident_id,
         &job.notice.signature,
         now,
         provider,
         "failed",
         Some(detail),
-    );
+    ) {
+        tracing::warn!(error=%error,"failed to record notification delivery failure");
+    }
     Err(format!("Notification could not be sent: {detail}."))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_joins_notification_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notification-shutdown.sqlite")).unwrap();
+        let dispatcher = Dispatcher::start(store);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dispatcher.health().worker_available {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        dispatcher.shutdown().await;
+        assert!(!dispatcher.health().worker_available);
+    }
     use crate::config::{Config, NotificationConfig};
     use std::{
         io::{Read, Write},
@@ -316,6 +503,46 @@ mod tests {
     fn severity_filter_orders_levels() {
         assert!(severity_rank("critical") > severity_rank("warning"));
         assert!(severity_rank("warning") > severity_rank("informational"));
+    }
+
+    #[test]
+    fn provider_status_retries_only_transient_failures() {
+        let unauthorized = provider_status_failure(reqwest::StatusCode::UNAUTHORIZED, None);
+        assert!(!unauthorized.retryable);
+        assert!(unauthorized.detail.contains("401"));
+
+        let unavailable = provider_status_failure(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            Some(Duration::from_secs(3)),
+        );
+        assert!(unavailable.retryable);
+        assert_eq!(unavailable.retry_after, Some(Duration::from_secs(3)));
+    }
+
+    #[tokio::test]
+    async fn missing_destination_is_reported_without_exposing_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("missing-destination.sqlite")).unwrap();
+        let dispatcher = Dispatcher::start(store.clone());
+        let mut config = Config::default();
+        config.notifications = NotificationConfig {
+            enabled: true,
+            provider: "ntfy".into(),
+            endpoint: None,
+            secret: Some("never-return-this".into()),
+            minimum_severity: "warning".into(),
+            cooldown_minutes: 30,
+        };
+
+        let result = dispatcher.send_test(&config).await;
+        assert!(result.unwrap_err().contains("endpoint is not configured"));
+        let health = dispatcher.health();
+        assert!(health.worker_available);
+        assert_eq!(health.failed_deliveries, 1);
+        assert_eq!(health.consecutive_failures, 1);
+        let detail = health.last_failure_detail.unwrap();
+        assert!(!detail.contains("never-return-this"));
+        assert_eq!(store.notifications(10).unwrap()[0].status, "failed");
     }
 
     #[tokio::test]
@@ -437,9 +664,18 @@ mod tests {
     #[tokio::test]
     async fn full_notification_queue_drops_without_waiting_for_the_monitor() {
         let (sender, _receiver) = mpsc::channel(1);
+        let (shutdown, _shutdown_rx) = watch::channel(false);
         let dispatcher = Dispatcher {
             sender,
             dropped_jobs: Arc::new(AtomicU64::new(0)),
+            health: Arc::new(DeliveryHealth {
+                worker_available: std::sync::atomic::AtomicBool::new(true),
+                failed_deliveries: AtomicU64::new(0),
+                consecutive_failures: AtomicU64::new(0),
+                last_failure: Mutex::new(None),
+            }),
+            shutdown,
+            worker: Arc::new(tokio::sync::Mutex::new(None)),
         };
         let mut config = Config::default();
         config.notifications.enabled = true;

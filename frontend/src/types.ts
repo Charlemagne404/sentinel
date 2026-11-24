@@ -96,7 +96,17 @@ export interface Overview {
   };
   service_summary: { total: number; failed: number; available?: boolean }; database_bytes: number; updated_at: number;
 }
-export interface Series { name: string; minutes: number; unit: string; points: [number, number][] }
+export type SeriesPoint = [number, number, number?, number?];
+export interface Series { name: string; minutes: number; unit: string; points: SeriesPoint[] }
+export interface NotificationDeliveryHealth {
+  worker_available: boolean;
+  queue_depth: number;
+  dropped_jobs: number;
+  failed_deliveries: number;
+  consecutive_failures: number;
+  last_failure_at: number | null;
+  last_failure_detail: string | null;
+}
 export interface PublicConfig {
   host_seconds: number; process_seconds: number; hardware_seconds: number; service_seconds: number;
   retention_hours: number; database_budget_mb: number;

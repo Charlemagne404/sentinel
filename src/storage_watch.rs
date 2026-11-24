@@ -238,7 +238,19 @@ impl StorageWatch {
             let connection = history
                 .lock()
                 .map_err(|_| anyhow::anyhow!("storage history lock poisoned"))?;
-            connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+            if busy != 0
+                || (log_frames >= 0
+                    && checkpointed_frames >= 0
+                    && checkpointed_frames < log_frames)
+            {
+                anyhow::bail!(
+                    "SQLite storage-history WAL checkpoint incomplete: busy={busy}, log_frames={log_frames}, checkpointed_frames={checkpointed_frames}"
+                );
+            }
             anyhow::Ok(())
         })
         .await

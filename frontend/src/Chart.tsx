@@ -15,6 +15,13 @@ interface ChartProps {
 export function Chart({ points, color = "#a4e4b5", height = 220, label, unit = "%", threshold }: ChartProps) {
   const element = useRef<HTMLDivElement>(null);
   const normalized = useMemo(() => alignedData(points), [points]);
+  const rangeSummary = useMemo(() => {
+    const measured = points.filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+    if (!measured.length) return "No measured samples";
+    const minimum = Math.min(...measured.map((point) => point[2] ?? point[1]));
+    const maximum = Math.max(...measured.map((point) => point[3] ?? point[1]));
+    return `${measured.length} samples; minimum ${minimum.toFixed(2)}${unit}, maximum ${maximum.toFixed(2)}${unit}`;
+  }, [points, unit]);
 
   useEffect(() => {
     const root = element.current;
@@ -55,5 +62,5 @@ export function Chart({ points, color = "#a4e4b5", height = 220, label, unit = "
     return () => { observer.disconnect(); plot.destroy(); };
   }, [normalized, color, height, label, unit, threshold]);
 
-  return <div className="chart-frame" aria-label={`${label} historical chart`} role="img"><div ref={element} className="chart-host" /></div>;
+  return <div className="chart-frame" aria-label={`${label} historical chart. ${rangeSummary}.`} role="img"><div ref={element} className="chart-host" /></div>;
 }
