@@ -72,10 +72,10 @@ impl ProcessCollector {
         }
     }
 
-    pub fn collect_with_lifecycle(&mut self) -> (Vec<ProcessSnapshot>, Vec<ProcessLifecycleEvent>) {
-        let Ok(entries) = fs::read_dir("/proc") else {
-            return (Vec::new(), Vec::new());
-        };
+    pub fn collect_with_lifecycle(
+        &mut self,
+    ) -> std::io::Result<(Vec<ProcessSnapshot>, Vec<ProcessLifecycleEvent>)> {
+        let entries = fs::read_dir("/proc")?;
         let entries = entries.flatten().collect::<Vec<_>>();
         let mut observed_pids = HashSet::new();
         let mut raw = Vec::<(ProcessSnapshot, u64)>::new();
@@ -186,7 +186,7 @@ impl ProcessCollector {
         self.cpu.retain(|key, _| alive.contains(key));
         let mut processes = raw.into_iter().map(|(p, _)| p).collect::<Vec<_>>();
         processes.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
-        (processes, lifecycle)
+        Ok((processes, lifecycle))
     }
 }
 

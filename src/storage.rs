@@ -33,6 +33,18 @@ pub struct Baseline {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct SeasonalValues {
+    pub metric: String,
+    pub pattern: String,
+    pub periods: usize,
+    pub first_timestamp: i64,
+    pub last_timestamp: i64,
+    pub median: f64,
+    pub mad: f64,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct NotificationRecord {
     pub id: i64,
     pub incident_id: Option<i64>,
@@ -142,6 +154,12 @@ impl Store {
     }
     pub fn path(&self) -> &Path {
         self.path.as_path()
+    }
+
+    pub fn health_readable(&self) -> anyhow::Result<()> {
+        let conn = self.lock()?;
+        let _: i64 = conn.query_row("SELECT 1", [], |row| row.get(0))?;
+        Ok(())
     }
 
     pub fn insert_snapshot(&self, snapshot: &HostSnapshot) -> anyhow::Result<()> {
@@ -391,40 +409,139 @@ impl Store {
         Ok(values)
     }
 
+    #[cfg(test)]
     pub fn baseline_values(
         &self,
         metric: &str,
         since: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<f64>> {
-        if !known_metric(metric) {
-            anyhow::bail!("unknown metric");
-        }
-        let conn = self.lock()?;
-        let mut stmt=conn.prepare("SELECT value FROM minute_points m WHERE name=? AND ts>=? AND NOT EXISTS(SELECT 1 FROM excluded_points e WHERE e.metric=m.name AND e.ts=m.ts) ORDER BY ts DESC LIMIT ?")?;
-        let values = stmt
-            .query_map(params![metric, since, limit.clamp(1, 10000) as i64], |r| {
-                r.get(0)
-            })?
-            .collect::<Result<Vec<f64>, _>>()?;
-        Ok(values.into_iter().rev().collect())
+        Ok(self
+            .baseline_observations(metric, since, limit)?
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect())
     }
 
-    pub fn baseline_first_timestamp(
+    pub fn baseline_observations(
         &self,
         metric: &str,
         since: i64,
-    ) -> anyhow::Result<Option<i64>> {
+        limit: usize,
+    ) -> anyhow::Result<Vec<(i64, f64)>> {
         if !known_metric(metric) {
             anyhow::bail!("unknown metric");
         }
         let conn = self.lock()?;
-        conn.query_row(
-            "SELECT min(m.ts) FROM minute_points m WHERE m.name=? AND m.ts>=? AND NOT EXISTS(SELECT 1 FROM excluded_points e WHERE e.metric=m.name AND e.ts=m.ts)",
-            params![metric, since],
-            |row| row.get(0),
-        )
-        .map_err(Into::into)
+        let mut stmt=conn.prepare("SELECT m.ts,m.value FROM minute_points m WHERE m.name=? AND m.ts>=? AND NOT EXISTS(SELECT 1 FROM excluded_points e WHERE e.metric=m.name AND e.ts=m.ts) ORDER BY m.ts DESC LIMIT ?")?;
+        let values = stmt
+            .query_map(params![metric, since, limit.clamp(1, 10000) as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<Result<Vec<(i64, f64)>, _>>()?;
+        Ok(values.into_iter().rev().collect())
+    }
+
+    /// Return a mature same-hour seasonal comparison. Hour-of-week models need
+    /// four clean weekly repetitions; hour-of-day models need fourteen distinct
+    /// daily windows. Incomplete patterns are deliberately not used for scoring.
+    pub fn seasonal_values(
+        &self,
+        metric: &str,
+        since: i64,
+        now: i64,
+    ) -> anyhow::Result<Option<SeasonalValues>> {
+        if !known_metric(metric) {
+            anyhow::bail!("unknown metric");
+        }
+        let conn = self.lock()?;
+        let since = since.max(now - 30 * 86400);
+        let current_hour = now.div_euclid(3600);
+        let weekday_hour = current_hour.saturating_add(72).rem_euclid(168);
+        let current_week_start = (now + 259200).div_euclid(604800) * 604800 - 259200;
+        let mut weekly = conn.prepare(
+            "SELECT min(m.ts),avg(m.value),max(m.ts),count(*) FROM minute_points m
+             WHERE m.name=?1 AND m.ts>=?2 AND m.ts<?3
+               AND ((m.ts/3600 + 72) % 168)=?4
+               AND NOT EXISTS(SELECT 1 FROM excluded_points e WHERE e.metric=m.name AND e.ts=m.ts)
+             GROUP BY CAST((m.ts + 259200)/604800 AS INTEGER) HAVING count(*)>=30 ORDER BY 1",
+        )?;
+        let weekly_rows = weekly
+            .query_map(
+                params![metric, since, current_week_start, weekday_hour],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        if weekly_rows.len() >= 4
+            && weekly_rows
+                .last()
+                .unwrap()
+                .2
+                .saturating_sub(weekly_rows[0].0)
+                >= 21 * 86400
+        {
+            let periods = weekly_rows.len();
+            let values = weekly_rows.iter().map(|row| row.1).collect::<Vec<_>>();
+            let (median, mad) = robust_summary(&values);
+            return Ok(Some(SeasonalValues {
+                metric: metric.into(),
+                pattern: "hour_of_week_utc".into(),
+                periods,
+                first_timestamp: weekly_rows[0].0,
+                last_timestamp: weekly_rows.last().unwrap().2,
+                median,
+                mad,
+                confidence: (periods as f64 / 4.0).clamp(0.0, 1.0),
+            }));
+        }
+
+        let current_day_start = now.div_euclid(86400) * 86400;
+        let hour_of_day = current_hour.rem_euclid(24);
+        let mut daily = conn.prepare(
+            "SELECT min(m.ts),avg(m.value),max(m.ts),count(*) FROM minute_points m
+             WHERE m.name=?1 AND m.ts>=?2 AND m.ts<?3
+               AND (m.ts/3600 % 24)=?4
+               AND NOT EXISTS(SELECT 1 FROM excluded_points e WHERE e.metric=m.name AND e.ts=m.ts)
+             GROUP BY CAST(m.ts/86400 AS INTEGER) HAVING count(*)>=30 ORDER BY 1",
+        )?;
+        let daily_rows = daily
+            .query_map(
+                params![metric, since, current_day_start, hour_of_day],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        if daily_rows.len() >= 14
+            && daily_rows.last().unwrap().2.saturating_sub(daily_rows[0].0) >= 13 * 86400
+        {
+            let periods = daily_rows.len();
+            let values = daily_rows.iter().map(|row| row.1).collect::<Vec<_>>();
+            let (median, mad) = robust_summary(&values);
+            return Ok(Some(SeasonalValues {
+                metric: metric.into(),
+                pattern: "hour_of_day_utc".into(),
+                periods,
+                first_timestamp: daily_rows[0].0,
+                last_timestamp: daily_rows.last().unwrap().2,
+                median,
+                mad,
+                confidence: (periods as f64 / 28.0).clamp(0.0, 1.0),
+            }));
+        }
+        Ok(None)
     }
 
     pub fn baseline_state(&self) -> anyhow::Result<(u32, i64)> {
@@ -520,22 +637,38 @@ impl Store {
         evidence: &serde_json::Value,
         explanation: &str,
         now: i64,
-    ) -> anyhow::Result<(i64, bool)> {
+    ) -> anyhow::Result<(i64, bool, bool)> {
         let conn = self.lock()?;
         let encoded = serde_json::to_string(evidence)?;
-        if let Some(id) = conn
+        if let Some((id, previous_severity)) = conn
             .query_row(
-                "SELECT id FROM incidents WHERE signature=? AND status='active'",
+                "SELECT id,severity FROM incidents WHERE signature=? AND status='active'",
                 [signature],
-                |r| r.get(0),
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()?
         {
-            conn.execute("UPDATE incidents SET severity=?2,title=?3,last_seen=?4,confidence=max(confidence,?5),evidence=?6,explanation=?7 WHERE id=?1",params![id,severity,title,now,confidence,encoded,explanation])?;
-            Ok((id, false))
+            let escalated = Self::incident_severity_rank(severity)
+                > Self::incident_severity_rank(&previous_severity);
+            let effective_severity = if escalated {
+                severity
+            } else {
+                &previous_severity
+            };
+            conn.execute("UPDATE incidents SET severity=?2,title=?3,last_seen=?4,confidence=max(confidence,?5),evidence=?6,explanation=?7 WHERE id=?1",params![id,effective_severity,title,now,confidence,encoded,explanation])?;
+            Ok((id, false, escalated))
         } else {
             conn.execute("INSERT INTO incidents(signature,severity,title,status,first_seen,last_seen,confidence,evidence,explanation) VALUES(?,?,?,'active',?,?,?,?,?)",params![signature,severity,title,now,now,confidence,encoded,explanation])?;
-            Ok((conn.last_insert_rowid(), true))
+            Ok((conn.last_insert_rowid(), true, false))
+        }
+    }
+
+    fn incident_severity_rank(severity: &str) -> u8 {
+        match severity {
+            "critical" => 3,
+            "warning" => 2,
+            "informational" => 1,
+            _ => 0,
         }
     }
 
@@ -1026,6 +1159,25 @@ impl HostSnapshot {
         v
     }
 }
+fn robust_summary(values: &[f64]) -> (f64, f64) {
+    fn median(values: &[f64]) -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let middle = sorted.len() / 2;
+        if sorted.len() % 2 == 0 {
+            (sorted[middle - 1] + sorted[middle]) / 2.0
+        } else {
+            sorted[middle]
+        }
+    }
+    let center = median(values);
+    let deviations = values
+        .iter()
+        .map(|value| (value - center).abs())
+        .collect::<Vec<_>>();
+    (center, median(&deviations))
+}
+
 fn known_metric(name: &str) -> bool {
     matches!(
         name,
@@ -1071,7 +1223,7 @@ fn known_workload_metric(name: &str) -> bool {
     let Some((key, suffix)) = encoded.rsplit_once("::") else {
         return false;
     };
-    if !matches!(suffix, "cpu_percent" | "rss_bytes") || key.len() > 320 {
+    if !matches!(suffix, "cpu_percent" | "rss_bytes" | "process_count") || key.len() > 320 {
         return false;
     }
     let Some((label, hash)) = key.rsplit_once('~') else {
@@ -1242,9 +1394,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("workload.sqlite")).unwrap();
         let metric = "workload::echo%20archives.service~0123456789abcdef::cpu_percent";
+        let population_metric = "workload::echo%20archives.service~0123456789abcdef::process_count";
         let minute = unix_now().div_euclid(60) * 60;
         store
-            .insert_named_metrics(minute - 30, &[(metric.into(), 12.5)])
+            .insert_named_metrics(
+                minute - 30,
+                &[(metric.into(), 12.5), (population_metric.into(), 4.0)],
+            )
             .unwrap();
         store.aggregate_until(minute).unwrap();
         assert_eq!(
@@ -1252,6 +1408,16 @@ mod tests {
             vec![12.5]
         );
         assert_eq!(store.chart(metric, minute - 60, 100).unwrap()[0][1], 12.5);
+        assert_eq!(
+            store
+                .baseline_values(population_metric, minute - 60, 100)
+                .unwrap(),
+            vec![4.0]
+        );
+        assert_eq!(
+            store.chart(population_metric, minute - 60, 100).unwrap()[0][1],
+            4.0
+        );
         assert!(
             store
                 .chart(
@@ -1261,6 +1427,49 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn weekly_seasonal_model_waits_for_four_clean_repetitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("seasonal.sqlite")).unwrap();
+        let metric = "cpu";
+        let now = 1_800_000_000_i64;
+        let current_week_start = (now + 259_200).div_euclid(604_800) * 604_800 - 259_200;
+        let hour_of_week = (now.div_euclid(3600) + 72).rem_euclid(168);
+        let insert_week = |store: &Store, week: i64| {
+            let conn = store.lock().unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            let hour_start = current_week_start - week * 604_800 + hour_of_week * 3600;
+            for minute in 0..60_i64 {
+                tx.execute(
+                    "INSERT INTO minute_points(ts,name,value) VALUES(?,?,?)",
+                    params![hour_start + minute * 60, metric, 10.0 + week as f64],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        };
+
+        for week in 1..=3 {
+            insert_week(&store, week);
+        }
+        assert!(
+            store
+                .seasonal_values(metric, now - 30 * 86400, now)
+                .unwrap()
+                .is_none()
+        );
+        insert_week(&store, 4);
+        let model = store
+            .seasonal_values(metric, now - 30 * 86400, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.pattern, "hour_of_week_utc");
+        assert_eq!(model.periods, 4);
+        assert_eq!(model.median, 12.5);
+        assert_eq!(model.mad, 1.0);
+        assert_eq!(model.confidence, 1.0);
     }
 
     #[test]
@@ -1338,7 +1547,7 @@ mod tests {
     fn incidents_deduplicate_and_recover() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("test.sqlite")).unwrap();
-        let (id, created) = s
+        let (id, created, initially_escalated) = s
             .open_or_update_incident(
                 "x",
                 "warning",
@@ -1349,7 +1558,7 @@ mod tests {
                 100,
             )
             .unwrap();
-        let (same, created_again) = s
+        let (same, created_again, escalated) = s
             .open_or_update_incident(
                 "x",
                 "critical",
@@ -1363,7 +1572,22 @@ mod tests {
         assert_eq!(id, same);
         assert!(created);
         assert!(!created_again);
+        assert!(!initially_escalated);
+        assert!(escalated);
+        let (_, _, downgraded) = s
+            .open_or_update_incident(
+                "x",
+                "warning",
+                "Test",
+                0.85,
+                &serde_json::json!({"fact":3}),
+                "why",
+                140,
+            )
+            .unwrap();
+        assert!(!downgraded);
         assert_eq!(s.incidents(true, 10).unwrap().len(), 1);
+        assert_eq!(s.incidents(true, 10).unwrap()[0].severity, "critical");
         assert!(s.recover_incident("x", 200).unwrap());
         assert_eq!(s.incidents(true, 10).unwrap().len(), 0);
     }

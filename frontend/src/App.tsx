@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, connectLive, finishSetup, restoreSession, signIn, signOut } from "./api";
 import { Chart } from "./Chart";
+import { StoragePage } from "./StoragePage";
 import { ago, bytes, clockTime, duration, percent, rate } from "./format";
 import { flattenProcessTree } from "./process-tree";
-import type { Baseline, HostSnapshot, Incident, Overview, ProcessLifecycleEvent, ProcessSnapshot, PublicConfig, ServiceSnapshot, Workload } from "./types";
+import type { AiInvestigation, Baseline, HostSnapshot, Incident, Overview, ProcessLifecycleEvent, ProcessSnapshot, PublicConfig, SeasonalBaseline, ServiceSnapshot, Workload } from "./types";
 
-type View = "overview" | "performance" | "processes" | "workloads" | "incidents" | "intelligence" | "services" | "settings";
+type View = "overview" | "performance" | "processes" | "workloads" | "incidents" | "intelligence" | "services" | "settings" | "storage";
 type Theme = "dark" | "light";
 const NAV: { id: View; label: string; index: string; glyph: string }[] = [
   { id: "overview", label: "Overview", index: "01", glyph: "◫" },
@@ -16,6 +17,7 @@ const NAV: { id: View; label: string; index: string; glyph: string }[] = [
   { id: "intelligence", label: "Intelligence", index: "06", glyph: "⌘" },
   { id: "services", label: "Services", index: "07", glyph: "▥" },
   { id: "settings", label: "Settings", index: "08", glyph: "⚙" },
+  { id: "storage", label: "Storage", index: "09", glyph: "▰" },
 ];
 
 function errorText(error: unknown): string {
@@ -152,6 +154,7 @@ export default function App() {
           {view === "intelligence" && <IntelligencePage tick={liveTick} />}
           {view === "services" && <ServicesPage tick={liveTick} />}
           {view === "settings" && <SettingsPage tick={liveTick} theme={theme} onToggleTheme={toggleTheme} onError={setPageError} />}
+          {view === "storage" && <StoragePage />}
         </div>
         <footer className="statusbar"><span><i className={`connection-dot ${connection}`} />{connection === "online" ? "COLLECTING" : connection === "stale" ? "LAST KNOWN STATE" : "OFFLINE"}</span><span>UPDATED {overview?.updated_at ? clockTime(overview.updated_at) : "—"}</span><span>LOCAL SERVER INTELLIGENCE</span></footer>
       </main>
@@ -218,9 +221,12 @@ function OverviewPage({ overview, tick, onNavigate }: { overview: Overview | nul
   const host = overview.host;
   const freeMem = host.memory_total_bytes ? host.memory_available_bytes / host.memory_total_bytes * 100 : null;
   const swapUsed = host.swap_total_bytes ? (host.swap_total_bytes - host.swap_free_bytes) / host.swap_total_bytes * 100 : 0;
+  const rootStorage = overview.storage_summary?.filesystems.find((filesystem) => filesystem.mount_point === "/");
   return <>
     <PageHeading index="01" title="Overview" detail={`${host.hostname} · online for ${duration(host.uptime_seconds)} · sampled ${ago(host.timestamp)}`} actions={<span className={`health-stamp ${overview.health}`}><i />{overview.health.toUpperCase()}</span>} />
     {host.collection_degraded.length > 0 && <div className="degraded-banner"><strong>Partial collection</strong><span>{host.collection_degraded.join(" · ")}</span></div>}
+    {overview.data_fresh === false && <div className="degraded-banner" role="status"><strong>Host data is stale</strong><span>Last successful sample {overview.sample_age_seconds == null ? "is unknown" : `${overview.sample_age_seconds}s ago`}. The dashboard is responding, but live monitoring is degraded.</span></div>}
+    {overview.database_write_ok === false && overview.data_fresh !== false && <div className="degraded-banner" role="status"><strong>Storage write is failing</strong><span>New observations may not be reaching history.</span></div>}
     <section className="resource-strip" aria-label="Current resource state">
       <ResourceReadout label="CPU" value={percent(host.cpu_percent)} meta={`${host.per_core.length} cores · load ${host.load.map((x) => x.toFixed(2)).join(" / ")}`} tone={host.cpu_percent > 85 ? "warning" : ""} />
       <ResourceReadout label="MEMORY AVAILABLE" value={percent(freeMem, 1)} meta={`${bytes(host.memory_available_bytes)} of ${bytes(host.memory_total_bytes)} free · ${host.oom_kill_count} OOM kills since boot`} tone={freeMem != null && freeMem < 8 ? "warning" : ""} />
@@ -246,7 +252,8 @@ function OverviewPage({ overview, tick, onNavigate }: { overview: Overview | nul
       </section>
       <section className="instrument-panel service-summary">
         <div className="section-head"><div><span className="eyebrow">SYSTEMD / READ ONLY</span><h2>Service state</h2></div><button className="quiet-link" onClick={() => onNavigate("services")}>View services <span>↗</span></button></div>
-        <div className="service-count"><strong>{overview.service_summary.total}</strong><span>visible units</span><em className={overview.service_summary.failed ? "warning" : "good"}>{overview.service_summary.failed ? `${overview.service_summary.failed} failed` : "No failed units"}</em></div>
+        <div className="service-count"><strong>{overview.service_summary.available === false ? "—" : overview.service_summary.total}</strong><span>{overview.service_summary.available === false ? "inventory unavailable" : "visible units"}</span><em className={overview.service_summary.available === false || overview.service_summary.failed ? "warning" : "good"}>{overview.service_summary.available === false ? "Unable to inspect" : overview.service_summary.failed ? `${overview.service_summary.failed} failed` : "No failed units"}</em></div>
+        {rootStorage && <div className="storage-line"><span>Root filesystem</span><strong className={rootStorage.severity === "ok" ? "good" : rootStorage.severity === "warning" ? "warning" : "critical-text"}>{rootStorage.used_percent.toFixed(1)}% used · {bytes(rootStorage.available_bytes)} free</strong></div>}
         <div className="storage-line"><span>Database footprint</span><strong>{bytes(overview.database_bytes)}</strong></div>
       </section>
     </div>
@@ -351,12 +358,14 @@ function ProcessesPage({ tick }: { tick: number }) {
   const [processes, setProcesses] = useState<ProcessSnapshot[]>([]);
   const [total, setTotal] = useState(0);
   const [lifecycle, setLifecycle] = useState<ProcessLifecycleEvent[]>([]);
+  const [gpuAttribution, setGpuAttribution] = useState<{ available: boolean; sampled_at: number | null; scope: string } | null>(null);
   const [selected, setSelected] = useState<ProcessSnapshot | null>(null);
   const [detail, setDetail] = useState<{ current: ProcessSnapshot | null; history: Record<string, number | string | boolean>[] } | null>(null);
   const [error, setError] = useState("");
+  const selectedProcess = selected ? processes.find((process) => process.key === selected.key) ?? selected : null;
   useEffect(() => {
     let live = true;
-    void api.processes(search, treeMode ? "tree" : sort).then((result) => { if (live) { setProcesses(result.processes); setTotal(result.total); setError(""); } }).catch((e) => { if (live) setError(errorText(e)); });
+    void api.processes(search, treeMode ? "tree" : sort).then((result) => { if (live) { setProcesses(result.processes); setTotal(result.total); setGpuAttribution(result.gpu_attribution); setError(""); } }).catch((e) => { if (live) setError(errorText(e)); });
     return () => { live = false; };
   }, [search, sort, treeMode, tick]);
   useEffect(() => {
@@ -372,6 +381,7 @@ function ProcessesPage({ tick }: { tick: number }) {
   }, [selected, tick]);
   return <>
     <PageHeading index="03" title="Processes" detail={`${total.toLocaleString()} observed · identity combines boot session, PID and process start ticks`} />
+    {gpuAttribution && gpuAttribution.sampled_at && <p className="secondary-line">{gpuAttribution.available ? `NVIDIA compute-process memory sampled ${ago(gpuAttribution.sampled_at)}.` : `NVIDIA compute-process attribution was unavailable at ${ago(gpuAttribution.sampled_at)}.`} Graphics-process memory may not be visible.</p>}
     {error && <InlineError text={error} />}
     <section className="instrument-panel process-explorer">
       <div className="table-toolbar"><label className="search-box"><span>⌕</span><input aria-label="Search processes" placeholder="Search name, executable, workload or PID" value={search} onChange={(e) => setSearch(e.target.value)} /></label><label className="select-control">SORT <select value={sort} disabled={treeMode} onChange={(e) => setSort(e.target.value)}><option value="cpu">CPU</option><option value="memory">Memory</option><option value="runtime">Runtime</option></select></label><button className={`filter-button tree-toggle ${treeMode ? "on" : ""}`} aria-pressed={treeMode} onClick={() => setTreeMode((value) => !value)}>Process tree</button><span className="table-count">{processes.length} SHOWN</span></div>
@@ -381,17 +391,18 @@ function ProcessesPage({ tick }: { tick: number }) {
       <div className="section-head"><div><span className="eyebrow">OBSERVED CHANGES / LAST 24 HOURS</span><h2>Process lifecycle</h2></div><small className="table-count">POLLING DETECTION</small></div>
       {lifecycle.length ? <div className="anomaly-list">{lifecycle.map((event, index) => <div className="anomaly-row" key={`${event.timestamp}-${event.key}-${event.kind}-${index}`}><span className="anomaly-time">{ago(event.timestamp)}</span><strong>{event.kind.replaceAll("_", " ")} · {event.name}</strong><span className="mono">PID {event.pid}</span><small>{event.workload} · {event.executable ?? `UID ${event.uid}`} · {event.cpu_percent.toFixed(1)}% CPU · {bytes(event.rss_bytes)} RSS</small></div>)}</div> : <Empty title="No lifecycle changes observed yet" detail="Sentinel records starts and exits between successful process polls. Processes shorter than the polling interval can be missed." />}
     </section>
-    {selected && <section className="instrument-panel detail-panel">
-      <div className="section-head"><div><span className="eyebrow">PROCESS INSPECTOR / PID {selected.pid}</span><h2>{selected.name}</h2></div><button className="icon-button" onClick={() => setSelected(null)} aria-label="Close process details">×</button></div>
-      {detail?.current ? <><div className="detail-facts"><StateLine label="Executable" value={detail.current.executable ?? "Not exposed"} /><StateLine label="Workload" value={detail.current.workload} /><StateLine label="Parent PID" value={detail.current.ppid} /><StateLine label="Runtime" value={duration(detail.current.runtime_seconds)} /><StateLine label="Memory RSS" value={bytes(detail.current.rss_bytes)} /><StateLine label="Parent identity" value={detail.current.parent_disappeared ? "Previously observed parent exited" : "Present or not established"} tone={detail.current.parent_disappeared ? "warning" : ""} /></div><div className="inspector-chart"><span className="eyebrow">CPU HISTORY / LAST 48 HOURS</span>{detail.history.length ? <Chart points={detail.history.map((p) => [Number(p.timestamp), Number(p.cpu_percent)] as [number, number])} label="Process CPU" unit="%" color="var(--mint)" height={170} /> : <div className="chart-empty">No persisted history for this process yet.</div>}</div></> : <LoadingLine label="Loading process history…" />}
+    {selectedProcess && <section className="instrument-panel detail-panel">
+      <div className="section-head"><div><span className="eyebrow">PROCESS INSPECTOR / PID {selectedProcess.pid}</span><h2>{selectedProcess.name}</h2></div><button className="icon-button" onClick={() => setSelected(null)} aria-label="Close process details">×</button></div>
+      {detail?.current ? <><div className="detail-facts"><StateLine label="Executable" value={detail.current.executable ?? "Not exposed"} /><StateLine label="Workload" value={detail.current.workload} /><StateLine label="Parent PID" value={detail.current.ppid} /><StateLine label="Runtime" value={duration(detail.current.runtime_seconds)} /><StateLine label="Memory RSS" value={bytes(detail.current.rss_bytes)} />{selectedProcess.gpu_memory_bytes != null && <StateLine label="GPU memory" value={bytes(selectedProcess.gpu_memory_bytes)} />}<StateLine label="Parent identity" value={detail.current.parent_disappeared ? "Previously observed parent exited" : "Present or not established"} tone={detail.current.parent_disappeared ? "warning" : ""} /></div><div className="inspector-chart"><span className="eyebrow">CPU HISTORY / LAST 48 HOURS</span>{detail.history.length ? <Chart points={detail.history.map((p) => [Number(p.timestamp), Number(p.cpu_percent)] as [number, number])} label="Process CPU" unit="%" color="var(--mint)" height={170} /> : <div className="chart-empty">No persisted history for this process yet.</div>}</div></> : <LoadingLine label="Loading process history…" />}
     </section>}
   </>;
 }
 function ProcessTable({ processes, compact = false, onSelect, selectedKey, treeMode = false }: { processes: ProcessSnapshot[]; compact?: boolean; onSelect?: (process: ProcessSnapshot) => void; selectedKey?: string; treeMode?: boolean }) {
   if (!processes.length) return <Empty title="No matching processes" detail="Try a shorter search or wait for the next collector sample." />;
   const rows = treeMode ? flattenProcessTree(processes) : processes.map((process) => ({ process, depth: 0 }));
-  return <div className="table-wrap"><table className={`data-table process-table ${compact ? "compact-table" : ""}`}><thead><tr><th>PROCESS</th><th>PID / PARENT</th><th>WORKLOAD</th><th>CPU</th><th>MEMORY</th><th>RUNTIME</th></tr></thead><tbody>{rows.map(({ process: p, depth }) => <tr key={p.key} className={`${onSelect ? "selectable" : ""} ${selectedKey === p.key ? "selected-row" : ""}`} onClick={() => onSelect?.(p)} onKeyDown={(e) => { if (onSelect && (e.key === "Enter" || e.key === " ")) onSelect(p); }} tabIndex={onSelect ? 0 : undefined}>
-    <td><div className="process-tree-name" style={{ paddingLeft: `${depth * 13}px` }}>{treeMode && depth > 0 && <span aria-hidden="true">↳</span>}<strong className="process-name">{p.name}</strong></div><small className="secondary-line">{p.executable ?? `UID ${p.uid}`} {p.parent_disappeared && <em className="warning-label">PARENT EXITED</em>}</small></td><td className="mono">{p.pid}<small className="secondary-line">parent {p.ppid}</small></td><td><span className="tag">{p.workload}</span></td><td className="mono">{p.cpu_percent.toFixed(1)}%</td><td className="mono">{bytes(p.rss_bytes)}</td><td className="mono">{duration(p.runtime_seconds)}</td>
+  const hasGpuMemory = rows.some(({ process }) => process.gpu_memory_bytes != null && process.gpu_memory_bytes > 0);
+  return <div className="table-wrap"><table className={`data-table process-table ${compact ? "compact-table" : ""}`}><thead><tr><th>PROCESS</th><th>PID / PARENT</th><th>WORKLOAD</th><th>CPU</th><th>MEMORY</th>{hasGpuMemory && <th>GPU VRAM</th>}<th>RUNTIME</th></tr></thead><tbody>{rows.map(({ process: p, depth }) => <tr key={p.key} className={`${onSelect ? "selectable" : ""} ${selectedKey === p.key ? "selected-row" : ""}`} onClick={() => onSelect?.(p)} onKeyDown={(e) => { if (onSelect && (e.key === "Enter" || e.key === " ")) onSelect(p); }} tabIndex={onSelect ? 0 : undefined}>
+    <td><div className="process-tree-name" style={{ paddingLeft: `${depth * 13}px` }}>{treeMode && depth > 0 && <span aria-hidden="true">↳</span>}<strong className="process-name">{p.name}</strong></div><small className="secondary-line">{p.executable ?? `UID ${p.uid}`} {p.parent_disappeared && <em className="warning-label">PARENT EXITED</em>}</small></td><td className="mono">{p.pid}<small className="secondary-line">parent {p.ppid}</small></td><td><span className="tag">{p.workload}</span></td><td className="mono">{p.cpu_percent.toFixed(1)}%</td><td className="mono">{bytes(p.rss_bytes)}</td>{hasGpuMemory && <td className="mono">{p.gpu_memory_bytes ? bytes(p.gpu_memory_bytes) : "—"}</td>}<td className="mono">{duration(p.runtime_seconds)}</td>
   </tr>)}</tbody></table></div>;
 }
 
@@ -424,7 +435,7 @@ function IncidentsPage({ tick, onError }: { tick: number; onError: (value: strin
   const [activeOnly, setActiveOnly] = useState(false);
   const [selected, setSelected] = useState<Incident | null>(null);
   const [detail, setDetail] = useState<Incident | null>(null);
-  const [investigation, setInvestigation] = useState("");
+  const [investigation, setInvestigation] = useState<AiInvestigation | null>(null);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
     let live = true;
@@ -439,8 +450,8 @@ function IncidentsPage({ tick, onError }: { tick: number; onError: (value: strin
   }, [selected, tick, onError]);
   const investigate = async () => {
     if (!selected) return;
-    setBusy(true); setInvestigation(""); onError("");
-    try { const result = await api.investigate(selected.id); setInvestigation(result.interpretation); }
+    setBusy(true); setInvestigation(null); onError("");
+    try { const result = await api.investigate(selected.id); setInvestigation(result.analysis); }
     catch (e) { onError(errorText(e)); }
     finally { setBusy(false); }
   };
@@ -448,21 +459,34 @@ function IncidentsPage({ tick, onError }: { tick: number; onError: (value: strin
     <PageHeading index="05" title="Incidents" detail="Correlated findings with measured evidence, confidence and recovery state." actions={<button className={`filter-button ${activeOnly ? "on" : ""}`} onClick={() => setActiveOnly((x) => !x)}><i /> Active only</button>} />
     <div className={`incident-workspace ${selected ? "has-selection" : ""}`}>
       <section className="instrument-panel incident-timeline"><div className="section-head"><div><span className="eyebrow">TIMELINE / {items.length.toString().padStart(2, "0")}</span><h2>{activeOnly ? "Open findings" : "Recent findings"}</h2></div></div>
-        {items.length ? <div className="incident-list">{items.map((item) => <button className={`timeline-item ${selected?.id === item.id ? "selected" : ""}`} key={item.id} onClick={() => { setSelected(item); setInvestigation(""); }}><span className={`timeline-marker ${item.severity}`} /><span className="timeline-date">{ago(item.first_seen)}</span><strong>{item.title}</strong><small>{item.explanation}</small><span className="timeline-meta"><Severity value={item.severity} /><span>{item.status}</span><span>{Math.round(item.confidence * 100)}% confidence</span></span></button>)}</div> : <Empty title="No incidents in this view" detail={activeOnly ? "There are no open incidents." : "The observation window has not produced a finding."} />}
+        {items.length ? <div className="incident-list">{items.map((item) => <button className={`timeline-item ${selected?.id === item.id ? "selected" : ""}`} key={item.id} onClick={() => { setSelected(item); setInvestigation(null); }}><span className={`timeline-marker ${item.severity}`} /><span className="timeline-date">{ago(item.first_seen)}</span><strong>{item.title}</strong><small>{item.explanation}</small><span className="timeline-meta"><Severity value={item.severity} /><span>{item.status}</span><span>{Math.round(item.confidence * 100)}% confidence</span></span></button>)}</div> : <Empty title="No incidents in this view" detail={activeOnly ? "There are no open incidents." : "The observation window has not produced a finding."} />}
       </section>
       {selected && <aside className="instrument-panel incident-detail"><div className="detail-topline"><span className="eyebrow">INCIDENT / #{selected.id}</span><button className="icon-button" aria-label="Close incident detail" onClick={() => setSelected(null)}>×</button></div>{detail ? <>
         <Severity value={detail.severity} /><h2>{detail.title}</h2><p className="incident-explanation">{detail.explanation}</p><div className="detail-facts"><StateLine label="Status" value={detail.status} /><StateLine label="First observed" value={new Date(detail.first_seen * 1000).toLocaleString()} /><StateLine label="Last observed" value={new Date(detail.last_seen * 1000).toLocaleString()} /><StateLine label="Confidence" value={`${Math.round(detail.confidence * 100)}%`} /></div>
         <div className="evidence-block"><span className="eyebrow">SUPPORTING EVIDENCE</span><pre>{JSON.stringify(detail.evidence, null, 2)}</pre></div>
         <div className="evidence-block"><span className="eyebrow">INTERPRETATION</span><p>Observed measurements and statistical findings are shown separately from inferred causes. Review the evidence before acting.</p></div>
         <button className="button secondary full" onClick={() => void investigate()} disabled={busy}>{busy ? "Checking host pressure…" : "Request local AI investigation"}</button><small className="field-hint">Runs only when a local endpoint is configured, AI is enabled and the host has sufficient headroom.</small>
-        {investigation && <div className="ai-result"><div className="eyebrow">LOCAL MODEL INTERPRETATION</div><p>{investigation}</p></div>}
+        {investigation && <div className="ai-result"><div className="ai-result-head"><span className="eyebrow">LOCAL MODEL INTERPRETATION</span><span>{Math.round(investigation.confidence * 100)}% model-reported confidence</span></div><p>{investigation.summary}</p>
+          <AiSection title="Model-classified facts" items={investigation.confirmed_facts} />
+          <AiSection title="Statistical abnormalities" items={investigation.statistical_abnormalities} />
+          <AiSection title="Inferences" items={investigation.inferences} />
+          <AiSection title="Speculation" items={investigation.speculation} />
+          <AiSection title="Read-only diagnostic suggestions" items={investigation.diagnostic_steps} />
+          <small>AI-generated categories and confidence are not independently calibrated. Compare them with Sentinel's measured evidence above.</small>
+        </div>}
       </> : <LoadingLine label="Loading incident evidence…" />}</aside>}
     </div>
   </>;
 }
 
+function AiSection({ title, items }: { title: string; items: string[] }) {
+  if (!items.length) return null;
+  return <section className="ai-result-section"><strong>{title}</strong><ul>{items.map((item, index) => <li key={`${title}-${index}`}>{item}</li>)}</ul></section>;
+}
+
 function IntelligencePage({ tick }: { tick: number }) {
   const [baselines, setBaselines] = useState<Baseline[]>([]);
+  const [seasonalModels, setSeasonalModels] = useState<SeasonalBaseline[]>([]);
   const [anomalies, setAnomalies] = useState<Record<string, unknown>[]>([]);
   const [learning, setLearning] = useState("");
   const [error, setError] = useState("");
@@ -471,7 +495,7 @@ function IntelligencePage({ tick }: { tick: number }) {
   const [resetting, setResetting] = useState(false);
   useEffect(() => {
     let live = true;
-    void api.intelligence().then((result) => { if (live) { setBaselines(result.baselines); setAnomalies(result.anomalies); setLearning(String(result.learning.maturity ?? "")); setBaselineVersion(result.baseline_version); setBaselineResetAt(result.baseline_reset_at); } }).catch((e) => { if (live) setError(errorText(e)); });
+    void api.intelligence().then((result) => { if (live) { setBaselines(result.baselines); setSeasonalModels(result.seasonal_models ?? []); setAnomalies(result.anomalies); setLearning(String(result.learning.maturity ?? "")); setBaselineVersion(result.baseline_version); setBaselineResetAt(result.baseline_reset_at); } }).catch((e) => { if (live) setError(errorText(e)); });
     return () => { live = false; };
   }, [tick]);
   const resetBaseline = async () => {
@@ -492,36 +516,56 @@ function IntelligencePage({ tick }: { tick: number }) {
   return <>
     <PageHeading index="06" title="Intelligence" detail="Statistical learning is deliberately cautious. Safety thresholds work immediately; behavioural baselines need clean history." />
     {error && <InlineError text={error} />}
-    <section className="intelligence-callout"><span className="callout-symbol">⌘</span><div><span className="eyebrow">CALIBRATION POLICY</span><strong>{learning || "Confidence grows with clean observations."}</strong><p>At least 48 hours of minute-level history are required before statistical anomaly findings are considered mature. Ongoing incidents and candidate anomalies are excluded from training.</p></div><div className="calibration-minimum"><strong>48h</strong><small>MINIMUM WINDOW</small></div></section>
+    <section className="intelligence-callout"><span className="callout-symbol">⌘</span><div><span className="eyebrow">CALIBRATION POLICY</span><strong>{learning || "Confidence grows with clean observations."}</strong><p>Rolling models need at least 48 clean hours. Time-of-day models need 14 clean daily windows; weekday and hour models need four clean weekly repetitions. Incident and candidate intervals are excluded.</p></div><div className="calibration-minimum"><strong>48h</strong><small>ROLLING MINIMUM</small></div></section>
+    <section className="instrument-panel seasonal-panel"><div className="section-head"><div><span className="eyebrow">TIME AWARE / {seasonalModels.length.toString().padStart(2, "0")} MATURE MODELS</span><h2>Observed periodic patterns</h2></div></div>{seasonalModels.length ? <div className="seasonal-model-list">{seasonalModels.map((model) => <div className="seasonal-model-row" key={`${model.metric}-${model.pattern}`}><strong>{baselineLabel(model.metric)}</strong><span>{model.pattern === "hour_of_week_utc" ? "Weekday × hour · UTC" : "Time of day · UTC"}</span><span>{model.periods} clean periods</span><span>MED <b>{model.median.toFixed(2)}</b> · MAD <b>{model.mad.toFixed(2)}</b></span><span className="seasonal-confidence">{Math.round(model.confidence * 100)}% evidence</span></div>)}</div> : <p className="seasonal-empty">No seasonal pattern has met its minimum evidence window yet. Sentinel will compare a metric to matching UTC hours only after enough clean daily or weekly periods are present.</p>}</section>
     <div className="intelligence-grid"><section className="instrument-panel baseline-panel"><div className="section-head"><div><span className="eyebrow">MODEL VERSION {baselineVersion} / {baselines.length} METRICS</span><h2>Metric baselines</h2><small className="model-reset-date">Calibration began {baselineResetAt ? ago(baselineResetAt) : "with Sentinel"}</small></div><button className="button secondary" type="button" onClick={() => void resetBaseline()} disabled={resetting}>{resetting ? "Resetting…" : "Reset baseline"}</button></div>{baselines.length ? <div className="baseline-list">{baselines.map((b) => <div className="baseline-row" key={b.metric}><div className="baseline-name"><strong>{baselineLabel(b.metric)}</strong><small>{b.samples.toLocaleString()} clean minute samples · {b.observed_hours.toFixed(1)} observed hours</small></div><div className="baseline-progress"><div><i style={{ width: `${Math.min(100, b.confidence * 100)}%` }} /></div><span>{Math.round(b.confidence * 100)}%</span></div><div className="baseline-stats"><span>MEDIAN <b>{b.median == null ? "—" : b.median.toFixed(2)}</b></span><span>MAD <b>{b.mad == null ? "—" : b.mad.toFixed(2)}</b></span><span>P95 <b>{b.p95 == null ? "—" : b.p95.toFixed(2)}</b></span><em className={b.frozen ? "warning-label" : ""}>{b.frozen ? "FROZEN" : "LEARNING"}</em></div></div>)}</div> : <Empty title="Baselines are forming" detail="Sentinel uses immediate safety thresholds while collecting enough clean observations for robust statistics." />}</section>
     <section className="instrument-panel anomaly-panel"><div className="section-head"><div><span className="eyebrow">LAST 7 DAYS / {anomalies.length}</span><h2>Recent anomalies</h2></div></div>{anomalies.length ? <div className="anomaly-list">{anomalies.map((a, i) => <div className="anomaly-row" key={`${String(a.timestamp)}-${i}`}><span className="anomaly-time">{typeof a.timestamp === "number" ? ago(a.timestamp) : "—"}</span><strong>{String(a.metric ?? "finding").replaceAll("_", " ")}</strong><span className="mono">{typeof a.value === "number" ? a.value.toFixed(2) : "—"}</span><small>{String(a.reason ?? "")}</small></div>)}</div> : <Empty title="No anomaly events yet" detail="Unusual values only appear after the relevant baseline matures or a safety rule triggers." />}</section></div>
   </>;
 }
 
 function baselineLabel(metric: string): string {
-  const match = /^workload::(.+)~[0-9a-f]{16}::(cpu_percent|rss_bytes)$/.exec(metric);
+  const match = /^workload::(.+)~[0-9a-f]{16}::(cpu_percent|rss_bytes|process_count)$/.exec(metric);
   if (!match) return metric.replaceAll("_", " ");
   let workload = match[1];
   try { workload = decodeURIComponent(workload); } catch { /* Keep the stored label readable if malformed. */ }
-  return `${workload} · ${match[2] === "cpu_percent" ? "CPU" : "RSS"}`;
+  const label = match[2] === "cpu_percent" ? "CPU" : match[2] === "rss_bytes" ? "RSS" : "process count";
+  return `${workload} · ${label}`;
 }
 
 function ServicesPage({ tick }: { tick: number }) {
   const [services, setServices] = useState<ServiceSnapshot[]>([]);
   const [available, setAvailable] = useState(false);
+  const [complete, setComplete] = useState(false);
+  const [userScopeAvailable, setUserScopeAvailable] = useState(false);
+  const [systemScopeAvailable, setSystemScopeAvailable] = useState(false);
   const [source, setSource] = useState("");
   const [filter, setFilter] = useState("");
   const [error, setError] = useState("");
   useEffect(() => {
     let live = true;
-    void api.services().then((result) => { if (live) { setServices(result.services); setAvailable(result.available); setSource(result.source); } }).catch((e) => { if (live) setError(errorText(e)); });
+    void api.services().then((result) => {
+      if (!live) return;
+      setServices(result.services);
+      setAvailable(result.available);
+      setComplete(result.complete);
+      setUserScopeAvailable(result.user_scope_available);
+      setSystemScopeAvailable(result.system_scope_available);
+      setSource(result.source);
+    }).catch((e) => { if (live) setError(errorText(e)); });
     return () => { live = false; };
   }, [tick]);
   const filtered = services.filter((s) => `${s.name} ${s.description} ${s.active}`.toLowerCase().includes(filter.toLowerCase()));
+  const unavailableScopes = [
+    !userScopeAvailable && "user",
+    !systemScopeAvailable && "system",
+  ].filter(Boolean).join(" and ");
   return <>
     <PageHeading index="07" title="Services" detail="Read-only systemd inventory. Sentinel never starts, stops or changes another service." actions={<span className="read-only-label"><i /> READ ONLY</span>} />
     {error && <InlineError text={error} />}
-    {!available ? <section className="instrument-panel"><Empty title="Service inventory unavailable" detail="systemctl returned no visible units. This can happen when the service manager is unavailable or permissions limit visibility." /></section> : <section className="instrument-panel service-explorer"><div className="table-toolbar"><label className="search-box"><span>⌕</span><input aria-label="Filter services" placeholder="Filter units" value={filter} onChange={(e) => setFilter(e.target.value)} /></label><span className="table-count">{filtered.length} UNITS · {source}</span></div><div className="table-wrap"><table className="data-table"><thead><tr><th>UNIT</th><th>DESCRIPTION</th><th>LOAD</th><th>ACTIVE</th><th>SUB STATE</th><th>RESTARTS</th></tr></thead><tbody>{filtered.map((s) => <tr key={s.name}><td><strong className="service-name">{s.name}</strong></td><td className="secondary-text">{s.description || "—"}</td><td><span className="tag">{s.load}</span></td><td><span className={`service-state ${s.active === "active" ? "good" : s.active === "failed" ? "bad" : ""}`}><i />{s.active}</span></td><td className="mono">{s.sub}</td><td className="mono">{s.restart_count}</td></tr>)}</tbody></table></div></section>}
+    {!available ? <section className="instrument-panel"><Empty title="Service inventory unavailable" detail="Neither systemd scope could be read. The service manager may be unavailable or permissions may limit visibility." /></section> : <>
+      {!complete && <div className="degraded-banner" role="status"><strong>Partial inventory</strong><span>The {unavailableScopes} systemd scope is unavailable; this list may omit units.</span></div>}
+      <section className="instrument-panel service-explorer"><div className="table-toolbar"><label className="search-box"><span>⌕</span><input aria-label="Filter services" placeholder="Filter units" value={filter} onChange={(e) => setFilter(e.target.value)} /></label><span className="table-count">{filtered.length} UNITS · {source}</span></div><div className="table-wrap">{filtered.length ? <table className="data-table"><thead><tr><th>UNIT</th><th>DESCRIPTION</th><th>LOAD</th><th>ACTIVE</th><th>SUB STATE</th><th>RESTARTS</th></tr></thead><tbody>{filtered.map((s) => <tr key={s.name}><td><strong className="service-name">{s.name}</strong></td><td className="secondary-text">{s.description || "—"}</td><td><span className="tag">{s.load}</span></td><td><span className={`service-state ${s.active === "active" ? "good" : s.active === "failed" ? "bad" : ""}`}><i />{s.active}</span></td><td className="mono">{s.sub}</td><td className="mono">{s.restart_count}</td></tr>)}</tbody></table> : <Empty title="No visible service units" detail="The accessible systemd scopes responded successfully but returned no service units." />}</div></section>
+    </>}
   </>;
 }
 

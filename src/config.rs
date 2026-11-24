@@ -10,6 +10,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub collection: CollectionConfig,
     pub thresholds: ThresholdConfig,
+    pub storage: StorageConfig,
     pub notifications: NotificationConfig,
     pub ai: AiConfig,
     #[serde(skip)]
@@ -50,6 +51,23 @@ pub struct ThresholdConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct StorageConfig {
+    /// Collect statvfs readings without recursively walking the filesystem.
+    pub sample_seconds: u64,
+    pub history_days: u64,
+    pub warning_used_percent: f64,
+    pub high_used_percent: f64,
+    pub critical_used_percent: f64,
+    pub warning_available_gib: u64,
+    pub high_available_gib: u64,
+    pub critical_available_gib: u64,
+    pub abnormal_growth_gib_per_hour: f64,
+    /// Mount points which must remain mounted and writable for their intended use.
+    pub required_writable_mounts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NotificationConfig {
     pub enabled: bool,
     pub provider: String,
@@ -67,6 +85,14 @@ pub struct AiConfig {
     pub endpoint: Option<String>,
     pub model: Option<String>,
     pub timeout_seconds: u64,
+}
+
+/// Split the configured SQLite budget between high-resolution host history
+/// and the independently sampled filesystem history. Keeping a fixed share
+/// lets both databases enforce retention without an unbounded side database.
+pub fn database_budget_partitions_mb(total_budget_mb: u64) -> (u64, u64) {
+    let history_mb = (total_budget_mb.saturating_mul(15) / 100).max(1);
+    (total_budget_mb.saturating_sub(history_mb), history_mb)
 }
 
 impl Default for Config {
@@ -97,6 +123,7 @@ impl Default for Config {
                 cpu_pressure_warning_percent: 20.0,
                 memory_pressure_warning_percent: 10.0,
             },
+            storage: StorageConfig::default(),
             notifications: NotificationConfig {
                 enabled: false,
                 provider: "ntfy".into(),
@@ -130,6 +157,22 @@ impl Default for CollectionConfig {
 impl Default for ThresholdConfig {
     fn default() -> Self {
         Config::default().thresholds
+    }
+}
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            sample_seconds: 900,
+            history_days: 365,
+            warning_used_percent: 80.0,
+            high_used_percent: 90.0,
+            critical_used_percent: 95.0,
+            warning_available_gib: 20,
+            high_available_gib: 10,
+            critical_available_gib: 5,
+            abnormal_growth_gib_per_hour: 1.0,
+            required_writable_mounts: vec!["/".into(), "/mnt/continental-cloud".into()],
+        }
     }
 }
 impl Default for NotificationConfig {
@@ -198,6 +241,51 @@ impl Config {
         anyhow::ensure!(
             self.server.database_budget_mb >= 50 && self.server.database_budget_mb <= 2048,
             "database_budget_mb must be between 50 and 2048"
+        );
+        anyhow::ensure!(
+            (300..=86_400).contains(&self.storage.sample_seconds),
+            "storage.sample_seconds must be between 300 and 86400"
+        );
+        anyhow::ensure!(
+            (30..=730).contains(&self.storage.history_days),
+            "storage.history_days must be between 30 and 730"
+        );
+        for (key, value) in [
+            ("warning_used_percent", self.storage.warning_used_percent),
+            ("high_used_percent", self.storage.high_used_percent),
+            ("critical_used_percent", self.storage.critical_used_percent),
+        ] {
+            anyhow::ensure!(
+                value.is_finite() && (0.0..=100.0).contains(&value),
+                "storage.{key} must be between 0 and 100"
+            );
+        }
+        anyhow::ensure!(
+            self.storage.warning_used_percent < self.storage.high_used_percent
+                && self.storage.high_used_percent < self.storage.critical_used_percent,
+            "storage thresholds must increase from warning to critical"
+        );
+        anyhow::ensure!(
+            self.storage.warning_available_gib > self.storage.high_available_gib
+                && self.storage.high_available_gib > self.storage.critical_available_gib
+                && self.storage.critical_available_gib > 0,
+            "storage available-space thresholds must decrease from warning to critical"
+        );
+        anyhow::ensure!(
+            self.storage.abnormal_growth_gib_per_hour.is_finite()
+                && self.storage.abnormal_growth_gib_per_hour > 0.0
+                && self.storage.abnormal_growth_gib_per_hour <= 1024.0,
+            "storage.abnormal_growth_gib_per_hour must be between 0 and 1024"
+        );
+        anyhow::ensure!(
+            !self.storage.required_writable_mounts.is_empty()
+                && self.storage.required_writable_mounts.len() <= 32
+                && self.storage.required_writable_mounts.iter().all(|mount| {
+                    mount.starts_with('/')
+                        && !mount.split('/').any(|component| component == "..")
+                        && mount.len() <= 1024
+                }),
+            "storage.required_writable_mounts must contain 1 to 32 absolute paths without parent traversal"
         );
         for (key, value) in [
             (
@@ -328,6 +416,49 @@ fn valid_notification_endpoint(provider: &str, value: &str) -> bool {
                 && url.path().starts_with("/api/webhooks/")
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn storage_policy_defaults_are_ordered_and_valid() {
+        let config = Config::default();
+        config.validate().unwrap();
+        assert_eq!(config.storage.warning_used_percent, 80.0);
+        assert_eq!(config.storage.high_used_percent, 90.0);
+        assert_eq!(config.storage.critical_used_percent, 95.0);
+        assert_eq!(config.storage.sample_seconds, 900);
+        assert!(
+            config
+                .storage
+                .required_writable_mounts
+                .contains(&"/".into())
+        );
+    }
+
+    #[test]
+    fn storage_policy_rejects_unsafe_ranges_and_parent_paths() {
+        let mut config = Config::default();
+        config.storage.high_used_percent = 79.0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.storage.required_writable_mounts = vec!["/mnt/../home".into()];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn database_budget_partitions_sum_to_total_and_reserve_a_bounded_history_share() {
+        for total in [50, 100, 500, 2048] {
+            let (main, history) = database_budget_partitions_mb(total);
+            assert_eq!(main + history, total);
+            assert!(history > 0);
+            assert!(history * 100 <= total * 15);
+        }
+        assert_eq!(database_budget_partitions_mb(500), (425, 75));
     }
 }
 

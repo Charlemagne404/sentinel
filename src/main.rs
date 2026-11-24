@@ -7,6 +7,7 @@ mod model;
 mod notifications;
 mod processes;
 mod storage;
+mod storage_watch;
 mod workloads;
 
 use clap::{Parser, Subcommand};
@@ -109,13 +110,32 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if result != "ok" {
                 anyhow::bail!("database integrity check failed");
             }
+            if let Some(storage_result) = storage_watch::integrity_history(
+                &config.server.database_dir.join("storage-history.sqlite"),
+            )? {
+                println!("Storage history: {storage_result}");
+            }
         }
         Some(Command::Db {
             command: DbCommand::Backup { destination },
         }) => {
+            let storage_source = config.server.database_dir.join("storage-history.sqlite");
+            let storage_destination = storage_history_backup_path(&destination);
+            anyhow::ensure!(
+                !storage_source.is_file() || !storage_destination.exists(),
+                "storage-history backup destination already exists: {}",
+                storage_destination.display()
+            );
             let db = storage::Store::open(&config.database_path())?;
             db.backup(&destination)?;
-            println!("Backup written to {}", destination.display());
+            println!("Main database backup written to {}", destination.display());
+            if storage_source.is_file() {
+                storage_watch::backup_history(&storage_source, &storage_destination)?;
+                println!(
+                    "Storage-history backup written to {}",
+                    storage_destination.display()
+                );
+            }
         }
         Some(Command::Admin {
             command: AdminCommand::ResetPassword,
@@ -132,6 +152,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Version) => unreachable!(),
     }
     Ok(())
+}
+
+fn storage_history_backup_path(destination: &std::path::Path) -> PathBuf {
+    let mut name = destination
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("sentinel-backup"))
+        .to_os_string();
+    name.push(".storage-history.sqlite");
+    destination
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(name)
 }
 
 fn doctor(config: &Config) -> anyhow::Result<()> {
@@ -238,11 +270,18 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         let _ = token;
     }
     let monitor = state.monitor.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let storage_task = tokio::spawn(state.storage_watch.clone().run(shutdown_rx));
     let shutdown = shutdown_signal();
-    tokio::select! {
-        result = axum::serve(listener, api::router(state).into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown) => result?,
-        result = monitor.run() => result?,
-    }
+    let service_result = tokio::select! {
+        result = axum::serve(listener, api::router(state).into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown) => result.map_err(anyhow::Error::from),
+        result = monitor.run() => result,
+    };
+    let _ = shutdown_tx.send(true);
+    storage_task
+        .await
+        .map_err(|error| anyhow::anyhow!("storage task failed: {error}"))?;
+    service_result?;
     Ok(())
 }
 

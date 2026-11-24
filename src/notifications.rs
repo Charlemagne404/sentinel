@@ -1,5 +1,11 @@
 use crate::{config::Config, storage::Store};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
@@ -9,11 +15,13 @@ pub struct IncidentNotice {
     pub severity: String,
     pub title: String,
     pub recovered: bool,
+    pub escalated: bool,
 }
 
 #[derive(Clone)]
 pub struct Dispatcher {
     sender: mpsc::Sender<Job>,
+    dropped_jobs: Arc<AtomicU64>,
 }
 
 struct Job {
@@ -27,7 +35,20 @@ impl Dispatcher {
     pub fn start(store: Store) -> Self {
         let (sender, receiver) = mpsc::channel(16);
         tokio::spawn(worker(receiver, store));
-        Self { sender }
+        Self {
+            sender,
+            dropped_jobs: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn queue_depth(&self) -> usize {
+        self.sender
+            .max_capacity()
+            .saturating_sub(self.sender.capacity())
+    }
+
+    pub fn dropped_jobs(&self) -> u64 {
+        self.dropped_jobs.load(Ordering::Relaxed)
     }
 
     pub async fn notify(&self, config: &Config, notice: IncidentNotice) {
@@ -37,21 +58,24 @@ impl Dispatcher {
         {
             return;
         }
-        let _ = self
+        if self
             .sender
-            .send(Job {
+            .try_send(Job {
                 config: config.clone(),
                 notice,
                 reply: None,
                 test: false,
             })
-            .await;
+            .is_err()
+        {
+            self.dropped_jobs.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub async fn send_test(&self, config: &Config) -> Result<String, String> {
         let (reply, receiver) = oneshot::channel();
         self.sender
-            .send(Job {
+            .try_send(Job {
                 config: config.clone(),
                 notice: IncidentNotice {
                     incident_id: None,
@@ -59,12 +83,12 @@ impl Dispatcher {
                     severity: "informational".into(),
                     title: "Sentinel test notification".into(),
                     recovered: false,
+                    escalated: false,
                 },
                 reply: Some(reply),
                 test: true,
             })
-            .await
-            .map_err(|_| "notification worker is unavailable".to_string())?;
+            .map_err(|_| "notification queue is full or the worker is unavailable".to_string())?;
         receiver
             .await
             .map_err(|_| "notification worker stopped before replying".to_string())?
@@ -108,7 +132,7 @@ async fn deliver(client: &reqwest::Client, store: &Store, job: &Job) -> Result<S
             );
         }
     };
-    if !job.test && !job.notice.recovered && config.cooldown_minutes > 0 {
+    if !job.test && !job.notice.recovered && !job.notice.escalated && config.cooldown_minutes > 0 {
         match store.last_notification_at(&job.notice.signature) {
             Ok(Some(last)) if now.saturating_sub(last) < config.cooldown_minutes as i64 * 60 => {
                 let _ = store.log_notification(
@@ -186,6 +210,8 @@ async fn send_provider(
 ) -> Result<(), &'static str> {
     let state = if notice.recovered {
         "recovered"
+    } else if notice.escalated {
+        "escalated"
     } else {
         "active"
     };
@@ -335,5 +361,103 @@ mod tests {
                 .unwrap_or("")
                 .contains("test-secret")
         );
+    }
+
+    #[tokio::test]
+    async fn severity_escalation_bypasses_cooldown_and_is_identified_to_provider() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut data = Vec::new();
+            let mut chunk = [0u8; 2048];
+            loop {
+                let length = socket.read(&mut chunk).unwrap();
+                if length == 0 {
+                    break;
+                }
+                data.extend_from_slice(&chunk[..length]);
+                if let Some(header_end) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&data[..header_end]);
+                    let content_length = headers.lines().find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    });
+                    if content_length
+                        .is_some_and(|body_len| data.len() >= header_end + 4 + body_len)
+                    {
+                        break;
+                    }
+                }
+            }
+            let data = String::from_utf8_lossy(&data);
+            assert!(data.contains("State: escalated"));
+            assert!(data.contains("CRITICAL"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("escalation.sqlite3")).unwrap();
+        let now = crate::storage::unix_now();
+        store
+            .log_notification(Some(1), "resource-pressure", now, "ntfy", "sent", None)
+            .unwrap();
+        let mut config = Config::default();
+        config.notifications = NotificationConfig {
+            enabled: true,
+            provider: "ntfy".into(),
+            endpoint: Some(format!("http://{address}/topic")),
+            secret: None,
+            minimum_severity: "warning".into(),
+            cooldown_minutes: 30,
+        };
+        let job = Job {
+            config: config.clone(),
+            notice: IncidentNotice {
+                incident_id: Some(1),
+                signature: "resource-pressure".into(),
+                severity: "critical".into(),
+                title: "Incident escalated: host pressure".into(),
+                recovered: false,
+                escalated: true,
+            },
+            reply: None,
+            test: false,
+        };
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        assert!(deliver(&client, &store, &job).await.is_ok());
+        server.join().unwrap();
+        assert_eq!(store.notifications(10).unwrap()[0].status, "sent");
+    }
+
+    #[tokio::test]
+    async fn full_notification_queue_drops_without_waiting_for_the_monitor() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let dispatcher = Dispatcher {
+            sender,
+            dropped_jobs: Arc::new(AtomicU64::new(0)),
+        };
+        let mut config = Config::default();
+        config.notifications.enabled = true;
+        config.notifications.minimum_severity = "warning".into();
+        let notice = || IncidentNotice {
+            incident_id: Some(1),
+            signature: "resource-pressure".into(),
+            severity: "warning".into(),
+            title: "Synthetic test".into(),
+            recovered: false,
+            escalated: false,
+        };
+
+        dispatcher.notify(&config, notice()).await;
+        assert_eq!(dispatcher.queue_depth(), 1);
+        dispatcher.notify(&config, notice()).await;
+
+        assert_eq!(dispatcher.queue_depth(), 1);
+        assert_eq!(dispatcher.dropped_jobs(), 1);
     }
 }

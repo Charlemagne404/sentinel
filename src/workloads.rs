@@ -12,43 +12,48 @@ pub fn group(processes: &[ProcessSnapshot]) -> BTreeMap<String, Vec<&ProcessSnap
     groups
 }
 
-/// Build bounded, stable metric names for the 25 busiest workload groups by CPU
-/// and memory. Names contain a readable percent-encoded label plus a stable hash.
+/// Build bounded, stable metric names for the 25 busiest workload groups by CPU,
+/// memory, and process population. Names contain a readable percent-encoded
+/// label plus a stable hash.
 pub fn baseline_metrics(processes: &[ProcessSnapshot]) -> Vec<(String, f64)> {
     let aggregates = group(processes)
         .into_iter()
         .map(|(name, members)| {
             let cpu = members.iter().map(|p| p.cpu_percent).sum::<f64>();
             let rss = members.iter().map(|p| p.rss_bytes).sum::<u64>();
-            (name, cpu, rss)
+            (name, cpu, rss, members.len())
         })
         .collect::<Vec<_>>();
     let mut by_cpu = aggregates.clone();
     by_cpu.sort_by(|a, b| b.1.total_cmp(&a.1));
     let mut by_memory = aggregates.clone();
     by_memory.sort_by_key(|item| std::cmp::Reverse(item.2));
+    let mut by_population = aggregates.clone();
+    by_population.sort_by_key(|item| std::cmp::Reverse(item.3));
     let mut selected = HashSet::new();
     selected.extend(by_cpu.into_iter().take(25).map(|item| item.0));
     selected.extend(by_memory.into_iter().take(25).map(|item| item.0));
+    selected.extend(by_population.into_iter().take(25).map(|item| item.0));
 
     let values = aggregates
         .into_iter()
-        .map(|(name, cpu, rss)| (name, (cpu, rss)))
+        .map(|(name, cpu, rss, count)| (name, (cpu, rss, count)))
         .collect::<HashMap<_, _>>();
-    let mut metrics = Vec::with_capacity(selected.len() * 2);
+    let mut metrics = Vec::with_capacity(selected.len() * 3);
     for name in selected {
-        let Some((cpu, rss)) = values.get(&name) else {
+        let Some((cpu, rss, count)) = values.get(&name) else {
             continue;
         };
         let key = workload_metric_key(&name);
         metrics.push((format!("workload::{key}::cpu_percent"), *cpu));
         metrics.push((format!("workload::{key}::rss_bytes"), *rss as f64));
+        metrics.push((format!("workload::{key}::process_count"), *count as f64));
     }
     metrics.sort_by(|a, b| a.0.cmp(&b.0));
     metrics
 }
 
-fn workload_metric_key(name: &str) -> String {
+pub fn workload_metric_key(name: &str) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in name.bytes() {
         hash ^= u64::from(byte);
@@ -154,7 +159,7 @@ mod tests {
             process("echo archives.service", 3.0, 150),
         ];
         let metrics = baseline_metrics(&processes);
-        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics.len(), 3);
         assert!(
             metrics
                 .iter()
@@ -164,6 +169,11 @@ mod tests {
             metrics
                 .iter()
                 .any(|(name, value)| name.ends_with("::rss_bytes") && *value == 250.0)
+        );
+        assert!(
+            metrics
+                .iter()
+                .any(|(name, value)| name.ends_with("::process_count") && *value == 2.0)
         );
         assert!(metrics[0].0.contains("echo%20archives.service"));
     }

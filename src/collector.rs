@@ -1,13 +1,14 @@
 use crate::{
     config::Config,
     model::{
-        GpuSnapshot, HostSnapshot, NetworkSnapshot, ProcessSnapshot, ServiceRestartEvent,
-        ServiceSnapshot, TemperatureReading,
+        GpuProcessUsage, GpuSnapshot, HostSnapshot, NetworkSnapshot, ProcessSnapshot,
+        ServiceRestartEvent, ServiceSnapshot, TemperatureReading,
     },
     notifications::Dispatcher,
     processes::ProcessCollector,
-    storage::{Store, unix_now},
+    storage::{SeasonalValues, Store, unix_now},
 };
+use serde::Serialize;
 use std::{
     collections::HashMap,
     fs,
@@ -23,7 +24,28 @@ pub struct LiveState {
     pub latest: Arc<RwLock<Option<HostSnapshot>>>,
     pub processes: Arc<RwLock<Vec<ProcessSnapshot>>>,
     pub services: Arc<RwLock<Vec<ServiceSnapshot>>>,
+    pub operational: Arc<RwLock<OperationalStatus>>,
+    pub seasonal_models: Arc<RwLock<Vec<SeasonalValues>>>,
     revision: watch::Sender<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OperationalStatus {
+    pub last_host_sample_at: Option<i64>,
+    pub last_process_scan_at: Option<i64>,
+    pub last_hardware_scan_at: Option<i64>,
+    pub last_service_scan_at: Option<i64>,
+    pub service_inventory_available: bool,
+    pub service_inventory_complete: bool,
+    pub user_service_scope_available: bool,
+    pub system_service_scope_available: bool,
+    pub last_database_write_at: Option<i64>,
+    pub last_database_write_ok: bool,
+    pub database_write_latency_ms: f64,
+    pub host_sample_duration_ms: f64,
+    pub missed_host_samples: u64,
+    pub process_collector_failures: u64,
+    pub database_write_failures: u64,
 }
 impl LiveState {
     pub fn new() -> Self {
@@ -32,6 +54,8 @@ impl LiveState {
             latest: Arc::new(RwLock::new(None)),
             processes: Arc::new(RwLock::new(Vec::new())),
             services: Arc::new(RwLock::new(Vec::new())),
+            operational: Arc::new(RwLock::new(OperationalStatus::default())),
+            seasonal_models: Arc::new(RwLock::new(Vec::new())),
             revision,
         }
     }
@@ -73,6 +97,10 @@ impl Monitor {
         let mut counters = Counters::default();
         let mut latest_temps = Vec::new();
         let mut latest_gpu = None;
+        let mut latest_gpu_processes = Vec::<GpuProcessUsage>::new();
+        let mut gpu_process_attribution_available = false;
+        let mut gpu_process_attribution_sampled_at = None;
+        let mut last_gpu_process_scan = Instant::now() - Duration::from_secs(60);
         let mut last_host = Instant::now() - Duration::from_secs(initial.collection.host_seconds);
         let mut last_process =
             Instant::now() - Duration::from_secs(initial.collection.process_seconds);
@@ -117,36 +145,95 @@ impl Monitor {
             if now.duration_since(last_process).as_secs() >= process_interval {
                 last_process = now;
                 let collector = self.processes.clone();
-                let (collected, lifecycle) = tokio::task::spawn_blocking(move || {
+                let result = tokio::task::spawn_blocking(move || {
                     collector
                         .lock()
                         .map(|mut c| c.collect_with_lifecycle())
-                        .unwrap_or_default()
+                        .map_err(|_| "process collector lock poisoned".to_string())
+                        .and_then(|result| result.map_err(|error| error.to_string()))
                 })
-                .await
-                .unwrap_or_default();
-                if !lifecycle.is_empty()
-                    && let Err(e) = self.store.record_process_lifecycle(&lifecycle)
-                {
-                    warn!(error=%e,"failed to persist process lifecycle events");
-                }
-                if now.duration_since(last_history).as_secs() >= 30 {
-                    if let Err(e) = self.store.save_processes(epoch, &collected) {
-                        warn!(error=%e,"failed to persist process sample");
+                .await;
+                match result {
+                    Ok(Ok((collected, lifecycle))) => {
+                        self.live.operational.write().await.last_process_scan_at = Some(epoch);
+                        if !lifecycle.is_empty()
+                            && let Err(e) = self.store.record_process_lifecycle(&lifecycle)
+                        {
+                            warn!(error=%e,"failed to persist process lifecycle events");
+                            self.live.operational.write().await.database_write_failures += 1;
+                        }
+                        if now.duration_since(last_history).as_secs() >= 30 {
+                            if let Err(e) = self.store.save_processes(epoch, &collected) {
+                                warn!(error=%e,"failed to persist process sample");
+                                self.live.operational.write().await.database_write_failures += 1;
+                            }
+                            last_history = now;
+                        }
+                        *self.live.processes.write().await = collected;
+                        did_update = true;
                     }
-                    last_history = now;
+                    Ok(Err(error)) => {
+                        warn!(
+                            error,
+                            "process collector failed; retaining the last inventory"
+                        );
+                        self.live
+                            .operational
+                            .write()
+                            .await
+                            .process_collector_failures += 1;
+                    }
+                    Err(error) => {
+                        warn!(error=%error,"process collector task failed; retaining the last inventory");
+                        self.live
+                            .operational
+                            .write()
+                            .await
+                            .process_collector_failures += 1;
+                    }
                 }
-                *self.live.processes.write().await = collected;
-                did_update = true;
             }
             if now.duration_since(last_hardware).as_secs() >= config.collection.hardware_seconds {
                 last_hardware = now;
                 latest_temps = read_temperatures();
                 latest_gpu = read_gpu().await;
+                self.live.operational.write().await.last_hardware_scan_at = Some(epoch);
+            }
+            if now.duration_since(last_gpu_process_scan).as_secs() >= 60 {
+                last_gpu_process_scan = now;
+                if latest_gpu.is_some() {
+                    match read_gpu_compute_apps().await {
+                        Some(processes) => {
+                            latest_gpu_processes = processes;
+                            gpu_process_attribution_available = true;
+                            gpu_process_attribution_sampled_at = Some(epoch);
+                        }
+                        None => {
+                            latest_gpu_processes.clear();
+                            gpu_process_attribution_available = false;
+                            gpu_process_attribution_sampled_at = Some(epoch);
+                        }
+                    }
+                } else {
+                    latest_gpu_processes.clear();
+                    gpu_process_attribution_available = false;
+                    gpu_process_attribution_sampled_at = None;
+                }
             }
             if now.duration_since(last_service).as_secs() >= config.collection.service_seconds {
                 last_service = now;
-                let services = collect_services().await;
+                let inventory = collect_services().await;
+                let inventory_available = inventory.available();
+                let inventory_complete = inventory.complete();
+                let services = inventory.services;
+                {
+                    let mut health = self.live.operational.write().await;
+                    health.last_service_scan_at = Some(epoch);
+                    health.user_service_scope_available = inventory.user_scope_available;
+                    health.system_service_scope_available = inventory.system_scope_available;
+                    health.service_inventory_available = inventory_available;
+                    health.service_inventory_complete = inventory_complete;
+                }
                 match self.store.observe_service_restarts(&services, epoch) {
                     Ok(events) => {
                         for event in events {
@@ -164,28 +251,56 @@ impl Monitor {
                     }
                     Err(e) => warn!(error=%e,"failed to observe service restart counters"),
                 }
-                *self.live.services.write().await = services;
+                if inventory_available {
+                    *self.live.services.write().await = services;
+                }
                 did_update = true;
             }
             if now.duration_since(last_host).as_secs() >= config.collection.host_seconds {
                 let elapsed = now.duration_since(last_host).as_secs_f64().max(0.1);
                 last_host = now;
                 let processes = self.live.processes.read().await.clone();
-                let mut snapshot = collect_host(
-                    &mut counters,
-                    elapsed,
-                    &latest_temps,
-                    latest_gpu.clone(),
-                    &processes,
-                );
+                let sample_started = Instant::now();
+                let mut gpu = latest_gpu.clone();
+                if let Some(gpu) = gpu.as_mut() {
+                    gpu.process_attribution_available = gpu_process_attribution_available;
+                    gpu.process_attribution_sampled_at = gpu_process_attribution_sampled_at;
+                    gpu.processes.clone_from(&latest_gpu_processes);
+                }
+                let mut snapshot =
+                    collect_host(&mut counters, elapsed, &latest_temps, gpu, &processes);
                 snapshot.timestamp = epoch;
                 if let Some(previous) = last_oom_kill_count {
                     pending_oom_kills = pending_oom_kills
                         .saturating_add(snapshot.oom_kill_count.saturating_sub(previous));
                 }
                 last_oom_kill_count = Some(snapshot.oom_kill_count);
-                if let Err(e) = self.store.insert_snapshot(&snapshot) {
-                    warn!(error=%e,"failed to write host sample");
+                let write_started = Instant::now();
+                let write_ok = match self.store.insert_snapshot(&snapshot) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(error=%e,"failed to write host sample");
+                        false
+                    }
+                };
+                {
+                    let mut health = self.live.operational.write().await;
+                    health.last_host_sample_at = Some(epoch);
+                    health.last_database_write_at = Some(epoch);
+                    health.last_database_write_ok = write_ok;
+                    health.database_write_latency_ms =
+                        write_started.elapsed().as_secs_f64() * 1000.0;
+                    health.host_sample_duration_ms =
+                        sample_started.elapsed().as_secs_f64() * 1000.0;
+                    if !write_ok {
+                        health.database_write_failures += 1;
+                    }
+                    let interval = config.collection.host_seconds.max(1);
+                    if elapsed > (interval.saturating_mul(2)) as f64 {
+                        health.missed_host_samples = health.missed_host_samples.saturating_add(
+                            (elapsed / interval as f64).floor().max(1.0) as u64 - 1,
+                        );
+                    }
                 }
                 *self.live.latest.write().await = Some(snapshot.clone());
                 if did_update || epoch % 5 == 0 {
@@ -212,6 +327,8 @@ impl Monitor {
                         epoch,
                     ) {
                         Ok(notices) => {
+                            *self.live.seasonal_models.write().await =
+                                evaluator.seasonal_models(epoch);
                             for notice in notices {
                                 self.notifications.notify(&config, notice).await;
                             }
@@ -231,10 +348,13 @@ impl Monitor {
                     }
                 } else {
                     last_cleanup = now;
+                    let (main_database_budget_mb, _) = crate::config::database_budget_partitions_mb(
+                        config.server.database_budget_mb,
+                    );
                     match self.store.cleanup(
                         epoch,
                         config.collection.retention_hours,
-                        config.server.database_budget_mb,
+                        main_database_budget_mb,
                     ) {
                         Ok(size) => debug!(database_bytes = size, "retention complete"),
                         Err(e) => warn!(error=%e,"retention maintenance failed"),
@@ -782,19 +902,94 @@ async fn read_gpu() -> Option<GpuSnapshot> {
         memory_total_bytes: parse(f[3]).map(|v| (v * 1024.0 * 1024.0) as u64),
         temperature_c: parse(f[4]),
         power_watts: parse(f[5]),
+        process_attribution_available: false,
+        process_attribution_sampled_at: None,
+        processes: Vec::new(),
     })
 }
 
-async fn collect_services() -> Vec<ServiceSnapshot> {
-    let (mut all, system) = tokio::join!(collect_service_scope(true), collect_service_scope(false));
-    all.extend(system);
-    all.sort_by(|a, b| a.name.cmp(&b.name));
-    all.dedup_by(|a, b| a.name == b.name);
-    all.truncate(500);
-    all
+async fn read_gpu_compute_apps() -> Option<Vec<GpuProcessUsage>> {
+    let command = tokio::process::Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(3), command)
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_gpu_compute_apps(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
-async fn collect_service_scope(user: bool) -> Vec<ServiceSnapshot> {
+fn parse_gpu_compute_apps(output: &str) -> Vec<GpuProcessUsage> {
+    output
+        .lines()
+        .take(64)
+        .filter_map(|line| {
+            let (identity, memory_mib) = line.rsplit_once(',')?;
+            let (pid, process_name) = identity.split_once(',')?;
+            let pid = pid.trim().parse::<u32>().ok()?;
+            let process_name = process_name.trim().to_string();
+            let memory_mib = memory_mib.trim().parse::<f64>().ok()?;
+            (pid > 0 && !process_name.is_empty() && memory_mib.is_finite() && memory_mib >= 0.0)
+                .then_some(GpuProcessUsage {
+                    pid,
+                    process_name,
+                    memory_used_bytes: (memory_mib * 1024.0 * 1024.0) as u64,
+                })
+        })
+        .collect()
+}
+
+struct ServiceInventory {
+    services: Vec<ServiceSnapshot>,
+    user_scope_available: bool,
+    system_scope_available: bool,
+}
+
+impl ServiceInventory {
+    fn available(&self) -> bool {
+        self.user_scope_available || self.system_scope_available
+    }
+
+    fn complete(&self) -> bool {
+        self.user_scope_available && self.system_scope_available
+    }
+}
+
+fn combine_service_scopes(
+    user: Option<Vec<ServiceSnapshot>>,
+    system: Option<Vec<ServiceSnapshot>>,
+) -> ServiceInventory {
+    let user_scope_available = user.is_some();
+    let system_scope_available = system.is_some();
+    let mut services = user.unwrap_or_default();
+    services.extend(system.unwrap_or_default());
+    services.sort_by(|a, b| a.name.cmp(&b.name));
+    services.dedup_by(|a, b| a.name == b.name);
+    services.truncate(500);
+    ServiceInventory {
+        services,
+        user_scope_available,
+        system_scope_available,
+    }
+}
+
+async fn collect_services() -> ServiceInventory {
+    let (user, system) = tokio::join!(collect_service_scope(true), collect_service_scope(false));
+    // `all` is the user-scope result; a successful empty result is distinct
+    // from a missing manager or a failed/timed-out systemctl invocation.
+    combine_service_scopes(user, system)
+}
+
+async fn collect_service_scope(user: bool) -> Option<Vec<ServiceSnapshot>> {
     let mut command = tokio::process::Command::new("systemctl");
     if user {
         command.arg("--user");
@@ -811,12 +1006,12 @@ async fn collect_service_scope(user: bool) -> Vec<ServiceSnapshot> {
         .kill_on_drop(true);
     let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(3), command.output()).await
     else {
-        return Vec::new();
+        return None;
     };
     if !output.status.success() {
-        return Vec::new();
+        return None;
     }
-    parse_service_show(&String::from_utf8_lossy(&output.stdout))
+    Some(parse_service_show(&String::from_utf8_lossy(&output.stdout)))
 }
 
 fn parse_service_show(raw: &str) -> Vec<ServiceSnapshot> {
@@ -868,6 +1063,20 @@ fn parse_service_show(raw: &str) -> Vec<ServiceSnapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_compute_app_parser_bounds_and_converts_process_memory() {
+        let processes = parse_gpu_compute_apps(
+            "101, /usr/bin/python3, 256\nnot-a-pid, worker, 20\n202, app, N/A\n303, renderer, 0\n",
+        );
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[0].pid, 101);
+        assert_eq!(processes[0].process_name, "/usr/bin/python3");
+        assert_eq!(processes[0].memory_used_bytes, 256 * 1024 * 1024);
+        assert_eq!(processes[1].pid, 303);
+        assert_eq!(processes[1].memory_used_bytes, 0);
+    }
+
     #[test]
     fn psi_parser_reads_avg10() {
         let raw = "some avg10=1.25 avg60=0.70 avg300=0.20 total=42\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0";
@@ -897,6 +1106,24 @@ mod tests {
         assert_eq!(parsed[0].name, "worker.service");
         assert_eq!(parsed[0].restart_count, 3);
         assert_eq!(parsed[0].description, "Worker=primary");
+    }
+
+    #[test]
+    fn service_inventory_distinguishes_empty_accessible_scopes_from_unavailable_scopes() {
+        let empty_but_accessible = combine_service_scopes(Some(Vec::new()), Some(Vec::new()));
+        assert!(empty_but_accessible.available());
+        assert!(empty_but_accessible.complete());
+        assert!(empty_but_accessible.services.is_empty());
+
+        let partially_accessible = combine_service_scopes(Some(Vec::new()), None);
+        assert!(partially_accessible.available());
+        assert!(!partially_accessible.complete());
+        assert!(partially_accessible.user_scope_available);
+        assert!(!partially_accessible.system_scope_available);
+
+        let unavailable = combine_service_scopes(None, None);
+        assert!(!unavailable.available());
+        assert!(!unavailable.complete());
     }
 
     #[test]

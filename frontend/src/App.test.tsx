@@ -29,7 +29,8 @@ const host: HostSnapshot = {
 const overview: Overview = {
   health: "healthy", host, top_processes: [process],
   workloads: [{ name: "sentinel-worker", display_name: "sentinel-worker", labels: [], process_count: 1, cpu_percent: 12.5, memory_bytes: process.rss_bytes, parent_lost_count: 0 }],
-  active_incidents: [], service_summary: { total: 2, failed: 0 }, database_bytes: 4096, updated_at: host.timestamp,
+  active_incidents: [], data_fresh: true, database_write_ok: true,
+  service_summary: { total: 2, failed: 0, available: true }, database_bytes: 4096, updated_at: host.timestamp,
 };
 
 const apiMocks = vi.hoisted(() => ({
@@ -52,15 +53,15 @@ describe("Sentinel application", () => {
     localStorage.clear();
     apiMocks.overview.mockResolvedValue(overview);
     apiMocks.series.mockResolvedValue({ name: "cpu", minutes: 360, unit: "%", points: [] });
-    apiMocks.processes.mockResolvedValue({ total: 1, filtered: 1, processes: [process] });
+    apiMocks.processes.mockResolvedValue({ total: 1, filtered: 1, gpu_attribution: { available: false, sampled_at: null, scope: "NVIDIA compute applications only" }, processes: [process] });
     apiMocks.process.mockResolvedValue({ current: process, history: [] });
     apiMocks.processLifecycle.mockResolvedValue({ minutes: 1440, events: [] });
     apiMocks.workloads.mockResolvedValue({ workloads: overview.workloads });
     apiMocks.incidents.mockResolvedValue({ incidents: [] });
     apiMocks.incident.mockResolvedValue(null);
-    apiMocks.intelligence.mockResolvedValue({ baselines: [], baseline_version: 1, baseline_reset_at: Math.floor(Date.now() / 1000), anomalies: [], learning: { maturity: "Confidence grows with clean observations." } });
+    apiMocks.intelligence.mockResolvedValue({ baselines: [], seasonal_models: [], baseline_version: 1, baseline_reset_at: Math.floor(Date.now() / 1000), anomalies: [], learning: { maturity: "Confidence grows with clean observations." } });
     apiMocks.resetIntelligence.mockResolvedValue({ baselines: [], baseline_version: 2, baseline_reset_at: Math.floor(Date.now() / 1000) });
-    apiMocks.services.mockResolvedValue({ services: [], available: false, source: "systemctl" });
+    apiMocks.services.mockResolvedValue({ services: [], available: false, complete: false, user_scope_available: false, system_scope_available: false, sampled_at: null, source: "systemctl" });
     apiMocks.config.mockResolvedValue({
       host_seconds: 5, process_seconds: 10, hardware_seconds: 15, service_seconds: 60,
       retention_hours: 48, database_budget_mb: 500,
@@ -92,6 +93,26 @@ describe("Sentinel application", () => {
     expect(screen.getAllByText("/usr/local/bin/sentinel-worker")).toHaveLength(2);
   });
 
+  it("shows fresh NVIDIA compute-process VRAM in the process explorer", async () => {
+    const sampledAt = Math.floor(Date.now() / 1000);
+    apiMocks.processes.mockResolvedValue({
+      total: 1,
+      filtered: 1,
+      gpu_attribution: { available: true, sampled_at: sampledAt, scope: "NVIDIA compute applications only" },
+      processes: [{ ...process, gpu_memory_bytes: 3 * 1024 ** 3 }],
+    });
+    render(<App />);
+    await screen.findByRole("heading", { name: "Overview" });
+    fireEvent.click(screen.getByRole("button", { name: "Processes" }));
+    expect(await screen.findByText(/NVIDIA compute-process memory sampled/)).toBeInTheDocument();
+    expect(await screen.findByRole("columnheader", { name: "GPU VRAM" })).toBeInTheDocument();
+    const row = await screen.findByRole("row", { name: /sentinel-worker/ });
+    expect(row).toHaveTextContent("3.00 GiB");
+    fireEvent.click(row);
+    expect(await screen.findByText("PROCESS INSPECTOR / PID 842")).toBeInTheDocument();
+    expect(screen.getAllByText("3.00 GiB")).toHaveLength(2);
+  });
+
   it("shows observed process lifecycle events alongside the live inventory", async () => {
     apiMocks.processLifecycle.mockResolvedValue({ minutes: 1440, events: [{
       timestamp: Math.floor(Date.now() / 1000), kind: "started", key: "boot-1:842:1234",
@@ -118,6 +139,31 @@ describe("Sentinel application", () => {
     await screen.findByRole("heading", { name: "Overview" });
     fireEvent.click(screen.getByRole("button", { name: "Services" }));
     expect(await screen.findByText("Service inventory unavailable")).toBeInTheDocument();
+  });
+
+  it("labels a partial systemd inventory instead of implying it is complete", async () => {
+    apiMocks.services.mockResolvedValue({ services: [], available: true, complete: false, user_scope_available: true, system_scope_available: false, sampled_at: Math.floor(Date.now() / 1000), source: "systemctl read-only inventory" });
+    render(<App />);
+    await screen.findByRole("heading", { name: "Overview" });
+    fireEvent.click(screen.getByRole("button", { name: "Services" }));
+    expect(await screen.findByText("Partial inventory")).toBeInTheDocument();
+    expect(screen.getByText(/system systemd scope is unavailable/)).toBeInTheDocument();
+  });
+
+  it("communicates stale samples and an inaccessible service inventory as degraded", async () => {
+    apiMocks.overview.mockResolvedValue({
+      ...overview,
+      health: "warning",
+      data_fresh: false,
+      sample_age_seconds: 90,
+      database_write_ok: false,
+      service_summary: { total: 0, failed: 0, available: false },
+    });
+    render(<App />);
+    expect(await screen.findByText("Host data is stale")).toBeInTheDocument();
+    expect(screen.getByText("Unable to inspect")).toBeInTheDocument();
+    expect(screen.queryByText("No failed units")).not.toBeInTheDocument();
+    expect(screen.getByText(/90s ago/)).toBeInTheDocument();
   });
 
   it("resets a baseline only after an explicit confirmation", async () => {

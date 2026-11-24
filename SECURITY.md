@@ -20,6 +20,8 @@ Sentinel does not read process environment variables or unrestricted command lin
 
 Configuration, bootstrap token, database, and user unit use restrictive permissions where created by Sentinel/scripts. Protect the account and backups. The browser stores only theme preference in localStorage; authentication uses an HttpOnly cookie.
 
+On-demand AI requests use a bounded evidence object. User IDs, executable paths, cgroups, command lines, environment fields, home paths, credentials, tokens, and password-like fields are removed; remaining telemetry strings are length-limited and treated as untrusted data. The model must return a bounded JSON schema that separates measured facts, statistical abnormalities, inferences, speculation, plain-language read-only diagnostic suggestions, and its self-reported confidence. Command-like diagnostic steps, invalid schemas, and unstructured responses are rejected. The confidence is not calibrated, and the model cannot execute commands.
+
 ## Operational limits
 
 Sentinel is read-only and does not run remediation commands. It does not require root. Permission or kernel-layout limitations are surfaced as missing data. The user-level systemd service adds resource and filesystem restrictions; verify actual compatibility and status on the host before relying on it.

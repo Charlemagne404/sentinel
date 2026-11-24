@@ -54,6 +54,16 @@ pub struct GpuSnapshot {
     pub memory_total_bytes: Option<u64>,
     pub temperature_c: Option<f64>,
     pub power_watts: Option<f64>,
+    pub process_attribution_available: bool,
+    pub process_attribution_sampled_at: Option<i64>,
+    pub processes: Vec<GpuProcessUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuProcessUsage {
+    pub pid: u32,
+    pub process_name: String,
+    pub memory_used_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -11,10 +11,10 @@ paths:
   /health:
     get:
       security: []
-      summary: Health and collector state
+      summary: Coarse daemon, sample freshness, and database status
       responses:
         "200":
-          description: Daemon health
+          description: Monitoring data is fresh and the database is readable and writable
           content:
             application/json:
               schema:
@@ -23,7 +23,38 @@ paths:
                   status: { type: string }
                   version: { type: string }
                   timestamp: { type: integer }
-                  collector_started: { type: boolean }
+                  process_running: { type: boolean }
+                  api_responding: { type: boolean }
+                  data_fresh: { type: boolean }
+                  database_readable: { type: boolean }
+                  database_write_ok: { type: boolean }
+        "503":
+          description: Monitoring is degraded; the body still reports whether the process and API are responding
+  /health/details:
+    get:
+      summary: Detailed protected collector, database, and daemon health
+      responses:
+        "200":
+          description: Operational status including freshness, combined database sizes, allocated budget shares and within-budget status, write latency, sample gaps, notification queue depth, and process RSS/thread count
+  /storage:
+    get:
+      summary: Current filesystem capacity and storage collector status
+      responses:
+        "200": { description: Capacity, inode, growth, mount errors, required mounts, history persistence, retained sample count, oldest timestamp, and storage-history budget status }
+  /storage/history:
+    get:
+      summary: Retained filesystem capacity history
+      parameters:
+        - in: query
+          name: mount_point
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 1024 }
+        - in: query
+          name: hours
+          schema: { type: integer, minimum: 1, maximum: 720, default: 168 }
+      responses:
+        "200": { description: Capacity samples ordered from oldest to newest }
+        "400": { description: Invalid mount path }
   /auth/status:
     get:
       security: []
@@ -110,7 +141,7 @@ paths:
         "400": { description: Unknown metric }
   /processes:
     get:
-      summary: Search and sort current process inventory
+      summary: Search and sort current process inventory with optional GPU process attribution
       parameters:
         - in: query
           name: q
@@ -122,7 +153,7 @@ paths:
           name: limit
           schema: { type: integer, minimum: 1, maximum: 1000, default: 500 }
       responses:
-        "200": { description: Process inventory }
+        "200": { description: Process inventory and NVIDIA compute-app attribution when available; graphics processes may not be reported }
   /process-lifecycle:
     get:
       summary: Recent process starts, exits, and observed parent losses
@@ -146,6 +177,11 @@ paths:
       responses:
         "200": { description: Process detail }
         "404": { description: No current or historical record }
+  /services:
+    get:
+      summary: Read-only systemd service inventory with per-scope availability
+      responses:
+        "200": { description: Visible service states, restart counts, and completeness of user/system scopes }
   /workloads:
     get:
       summary: Current process groups with user labels
@@ -200,7 +236,7 @@ paths:
         "404": { description: Incident not found }
   /incidents/{id}/investigate:
     post:
-      summary: Ask a configured local model to interpret sanitized evidence
+      summary: Ask a configured local model for bounded structured interpretation of sanitized evidence
       parameters:
         - in: path
           name: id
@@ -208,8 +244,9 @@ paths:
           schema: { type: integer }
         - $ref: "#/components/parameters/CsrfToken"
       responses:
-        "200": { description: AI interpretation and supplied evidence }
+        "200": { description: Structured facts, statistical abnormalities, inferences, speculation, safe diagnostic suggestions, uncalibrated self-reported confidence, and separately supplied sanitized evidence }
         "503": { description: AI disabled or host pressure guard active }
+        "502": { description: Local provider failure or invalid structured output }
   /anomalies:
     get:
       summary: List recent anomalies
@@ -224,7 +261,7 @@ paths:
         "200": { description: Anomaly history }
   /intelligence:
     get:
-      summary: Read baseline versions, baseline rows, and recent anomalies
+      summary: Read rolling and mature seasonal baselines, model confidence, and recent anomalies
       responses:
         "200": { description: Intelligence status }
     delete:

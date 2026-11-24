@@ -7,6 +7,9 @@ export interface GpuSnapshot {
   memory_total_bytes?: number | null;
   temperature_c?: number | null;
   power_watts?: number | null;
+  process_attribution_available?: boolean;
+  process_attribution_sampled_at?: number | null;
+  processes?: { pid: number; memory_used_bytes: number }[];
 }
 export interface NetworkSnapshot {
   name: string; state: string; rx_bytes: number; tx_bytes: number;
@@ -44,6 +47,7 @@ export interface ProcessSnapshot {
   runtime_seconds: number; cpu_percent: number; rss_bytes: number;
   virtual_bytes: number; process_group: number; session: number;
   cgroup?: string | null; workload: string; parent_disappeared: boolean;
+  gpu_memory_bytes?: number | null;
 }
 export interface ProcessLifecycleEvent {
   timestamp: number; kind: "started" | "exited" | "parent_lost"; key: string;
@@ -60,10 +64,24 @@ export interface Incident {
   last_seen: number; recovered_at?: number | null; confidence: number;
   evidence: unknown; explanation: string;
 }
+export interface AiInvestigation {
+  summary: string;
+  confirmed_facts: string[];
+  statistical_abnormalities: string[];
+  inferences: string[];
+  speculation: string[];
+  diagnostic_steps: string[];
+  confidence: number;
+}
 export interface Baseline {
   metric: string; version: number; samples: number; first_timestamp: number; observed_hours: number;
   median?: number | null; mad?: number | null; ewma?: number | null;
   p95?: number | null; confidence: number; frozen: boolean; updated_at: number;
+}
+export interface SeasonalBaseline {
+  metric: string; pattern: "hour_of_day_utc" | "hour_of_week_utc";
+  periods: number; first_timestamp: number; last_timestamp: number;
+  median: number; mad: number; confidence: number;
 }
 export interface ServiceSnapshot {
   name: string; load: string; active: string; sub: string; description: string; restart_count: number;
@@ -71,7 +89,12 @@ export interface ServiceSnapshot {
 export interface Overview {
   health: Health; host?: HostSnapshot | null; top_processes: ProcessSnapshot[];
   workloads: Workload[]; active_incidents: Incident[];
-  service_summary: { total: number; failed: number }; database_bytes: number; updated_at: number;
+  data_fresh?: boolean; sample_age_seconds?: number | null; database_write_ok?: boolean;
+  storage_summary?: {
+    severity: string; sampled_at: number; sample_fresh: boolean; history_persistent: boolean;
+    filesystems: { mount_point: string; used_percent: number; available_bytes: number; severity: string }[];
+  };
+  service_summary: { total: number; failed: number; available?: boolean }; database_bytes: number; updated_at: number;
 }
 export interface Series { name: string; minutes: number; unit: string; points: [number, number][] }
 export interface PublicConfig {
@@ -85,4 +108,61 @@ export interface PublicConfig {
   notification_enabled: boolean; notification_provider: string;
   ai_enabled: boolean; ai_provider: string; interface: string; port: number; config_path: string;
   notification_configured: boolean; ai_configured: boolean;
+}
+
+export interface StoragePolicy {
+  sample_seconds: number;
+  history_days: number;
+  warning_used_percent: number;
+  high_used_percent: number;
+  critical_used_percent: number;
+  warning_available_gib: number;
+  high_available_gib: number;
+  critical_available_gib: number;
+  abnormal_growth_gib_per_hour: number;
+  required_writable_mounts: string[];
+}
+export interface FilesystemUsage {
+  mount_point: string;
+  aliases: string[];
+  source: string;
+  filesystem: string;
+  read_only: boolean;
+  required_writable: boolean;
+  total_bytes: number;
+  used_bytes: number;
+  free_bytes: number;
+  available_bytes: number;
+  unavailable_free_bytes: number;
+  used_percent: number;
+  inode_total: number;
+  inode_used: number;
+  inode_available: number;
+  inode_used_percent: number;
+  growth_bytes_per_hour: number | null;
+  hours_until_full: number | null;
+  severity: string;
+  reasons: string[];
+}
+export interface StorageReport {
+  sampled_at: number;
+  last_attempt_at: number;
+  consecutive_failures: number;
+  severity: string;
+  policy: StoragePolicy;
+  history_persistent: boolean;
+  history_budget_bytes: number;
+  history_samples: number;
+  history_oldest_sample_at: number | null;
+  history_truncated_by_budget: boolean;
+  filesystems: FilesystemUsage[];
+  mount_errors: { mount_point: string; error: string }[];
+  missing_required_mounts: string[];
+  error: string | null;
+  history_error: string | null;
+}
+export interface StorageHistory {
+  mount_point: string;
+  hours: number;
+  points: { sampled_at: number; total_bytes: number; used_bytes: number; available_bytes: number; severity: string }[];
 }

@@ -25,6 +25,18 @@ The installer creates ~/.config/sentinel/config.toml with restrictive permission
     cpu_pressure_warning_percent = 20.0
     memory_pressure_warning_percent = 10.0
 
+    [storage]
+    sample_seconds = 900
+    history_days = 365
+    warning_used_percent = 80.0
+    high_used_percent = 90.0
+    critical_used_percent = 95.0
+    warning_available_gib = 20
+    high_available_gib = 10
+    critical_available_gib = 5
+    abnormal_growth_gib_per_hour = 1.0
+    required_writable_mounts = ["/", "/mnt/continental-cloud"]
+
     [notifications]
     enabled = false
     provider = "ntfy"
@@ -40,8 +52,8 @@ The installer creates ~/.config/sentinel/config.toml with restrictive permission
     model = ""
     timeout_seconds = 60
 
-Valid ranges: host 1–60s, process/hardware 5–300s, services 10–600s, retention 6–168h, database budget 50–2048 MiB, session 1–168h (clamped), notification cooldown at most 1440 minutes, and AI timeout 5–180s. Notification destinations must be HTTPS except loopback HTTP ntfy. Discord URLs are restricted to Discord webhook hosts and path. AI endpoints must be loopback HTTP(S); credentials in URL userinfo and URL fragments are rejected.
+Valid ranges: host 1–60s, process/hardware 5–300s, services 10–600s, retention 6–168h, total SQLite budget 50–2048 MiB, storage samples 300–86400s, storage history 30–730 days, session 1–168h (clamped), notification cooldown at most 1440 minutes, and AI timeout 5–180s. The total database budget reserves 15% for filesystem history and 85% for the main metrics database; storage history trims oldest complete sample timestamps when its budget is reached. Absolute free-space thresholds apply to filesystems at least twice as large as the configured warning-free-space threshold; smaller filesystems use percentage and inode thresholds, avoiding false critical alerts on small boot partitions. Up to 32 required writable mount paths may be configured. Notification destinations must be HTTPS except loopback HTTP ntfy. Discord URLs are restricted to Discord webhook hosts and path. AI endpoints must be loopback HTTP(S); credentials in URL userinfo and URL fragments are rejected.
 
-The authenticated settings page changes sampling, retention, thresholds and enable/disable toggles for configured notification/AI integrations. Provider endpoints, models, and secrets are edited in the config file. API responses report whether an endpoint is configured but never return secrets. Changes are atomically written with mode 0600 and take effect in the process.
+The authenticated settings page changes host sampling, retention, thresholds and enable/disable toggles for configured notification/AI integrations. Storage sampling and required mount paths are currently configured in this file. Provider endpoints, models, and secrets are also edited here. API responses report whether an endpoint is configured but never return secrets. Changes are atomically written with mode 0600 and take effect in the process.
 
 tailscale0 is the default private interface. Sentinel resolves its current address when binding and uses 127.0.0.1 if absent. Other interface names are rejected unless they begin with tailscale or are loopback.
