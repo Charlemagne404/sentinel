@@ -26,6 +26,7 @@ export interface HostSnapshot {
   memory_cached_bytes: number; memory_buffers_bytes: number;
   swap_total_bytes: number; swap_free_bytes: number;
   swap_in_bytes_per_sec: number; swap_out_bytes_per_sec: number;
+  oom_kill_count: number;
   psi_cpu_some_percent?: number | null; psi_memory_some_percent?: number | null;
   psi_memory_full_percent?: number | null; psi_io_some_percent?: number | null;
   cpu_temperature_c?: number | null; cpu_temperature_limit_c?: number | null;
@@ -44,6 +45,11 @@ export interface ProcessSnapshot {
   virtual_bytes: number; process_group: number; session: number;
   cgroup?: string | null; workload: string; parent_disappeared: boolean;
 }
+export interface ProcessLifecycleEvent {
+  timestamp: number; kind: "started" | "exited" | "parent_lost"; key: string;
+  pid: number; ppid: number; uid: number; name: string; executable?: string | null;
+  workload: string; cpu_percent: number; rss_bytes: number; runtime_seconds: number;
+}
 export interface Workload {
   name: string; display_name: string; labels: string[]; process_count: number;
   cpu_percent: number; memory_bytes: number; parent_lost_count: number;
@@ -60,7 +66,7 @@ export interface Baseline {
   p95?: number | null; confidence: number; frozen: boolean; updated_at: number;
 }
 export interface ServiceSnapshot {
-  name: string; load: string; active: string; sub: string; description: string;
+  name: string; load: string; active: string; sub: string; description: string; restart_count: number;
 }
 export interface Overview {
   health: Health; host?: HostSnapshot | null; top_processes: ProcessSnapshot[];

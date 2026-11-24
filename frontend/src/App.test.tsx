@@ -17,7 +17,7 @@ const host: HostSnapshot = {
   memory_total_bytes: 16 * 1024 ** 3, memory_available_bytes: 8 * 1024 ** 3,
   memory_used_bytes: 8 * 1024 ** 3, memory_cached_bytes: 2 * 1024 ** 3, memory_buffers_bytes: 0,
   swap_total_bytes: 4 * 1024 ** 3, swap_free_bytes: 4 * 1024 ** 3,
-  swap_in_bytes_per_sec: 0, swap_out_bytes_per_sec: 0,
+  swap_in_bytes_per_sec: 0, swap_out_bytes_per_sec: 0, oom_kill_count: 0,
   psi_cpu_some_percent: 0.1, psi_memory_some_percent: 0, psi_memory_full_percent: 0,
   psi_io_some_percent: 0, cpu_temperature_c: 42, cpu_temperature_limit_c: 100,
   temperatures: [], thermal_throttle_count: 0, disk_total_bytes: 500 * 1024 ** 3,
@@ -33,7 +33,7 @@ const overview: Overview = {
 };
 
 const apiMocks = vi.hoisted(() => ({
-  overview: vi.fn(), series: vi.fn(), processes: vi.fn(), process: vi.fn(), workloads: vi.fn(),
+  overview: vi.fn(), series: vi.fn(), processes: vi.fn(), process: vi.fn(), processLifecycle: vi.fn(), workloads: vi.fn(),
   incidents: vi.fn(), incident: vi.fn(), intelligence: vi.fn(), resetIntelligence: vi.fn(), services: vi.fn(), config: vi.fn(),
   notificationHistory: vi.fn(), authStatus: vi.fn(),
 }));
@@ -54,6 +54,7 @@ describe("Sentinel application", () => {
     apiMocks.series.mockResolvedValue({ name: "cpu", minutes: 360, unit: "%", points: [] });
     apiMocks.processes.mockResolvedValue({ total: 1, filtered: 1, processes: [process] });
     apiMocks.process.mockResolvedValue({ current: process, history: [] });
+    apiMocks.processLifecycle.mockResolvedValue({ minutes: 1440, events: [] });
     apiMocks.workloads.mockResolvedValue({ workloads: overview.workloads });
     apiMocks.incidents.mockResolvedValue({ incidents: [] });
     apiMocks.incident.mockResolvedValue(null);
@@ -89,6 +90,19 @@ describe("Sentinel application", () => {
     fireEvent.click(row);
     expect(await screen.findByText("PROCESS INSPECTOR / PID 842")).toBeInTheDocument();
     expect(screen.getAllByText("/usr/local/bin/sentinel-worker")).toHaveLength(2);
+  });
+
+  it("shows observed process lifecycle events alongside the live inventory", async () => {
+    apiMocks.processLifecycle.mockResolvedValue({ minutes: 1440, events: [{
+      timestamp: Math.floor(Date.now() / 1000), kind: "started", key: "boot-1:842:1234",
+      pid: 842, ppid: 1, uid: 1000, name: "sentinel-worker", executable: "/usr/local/bin/sentinel-worker",
+      workload: "sentinel-worker", cpu_percent: 12.5, rss_bytes: 12 * 1024 * 1024, runtime_seconds: 1,
+    }] });
+    render(<App />);
+    await screen.findByRole("heading", { name: "Overview" });
+    fireEvent.click(screen.getByRole("button", { name: "Processes" }));
+    expect(await screen.findByRole("heading", { name: "Process lifecycle" })).toBeInTheDocument();
+    expect(await screen.findByText(/started · sentinel-worker/)).toBeInTheDocument();
   });
 
   it("switches to the light theme and persists only the display preference", async () => {

@@ -1,8 +1,8 @@
 use crate::{
     config::Config,
     model::{
-        GpuSnapshot, HostSnapshot, NetworkSnapshot, ProcessSnapshot, ServiceSnapshot,
-        TemperatureReading,
+        GpuSnapshot, HostSnapshot, NetworkSnapshot, ProcessSnapshot, ServiceRestartEvent,
+        ServiceSnapshot, TemperatureReading,
     },
     notifications::Dispatcher,
     processes::ProcessCollector,
@@ -85,6 +85,15 @@ impl Monitor {
         let mut last_cleanup_defer = Instant::now();
         let mut last_intel_bucket = 0_i64;
         let mut evaluator = crate::intelligence::Evaluator::default();
+        let mut last_oom_kill_count = self
+            .store
+            .latest_snapshot()
+            .ok()
+            .flatten()
+            .map(|snapshot| snapshot.oom_kill_count)
+            .or_else(|| Some(read_vmstat().2));
+        let mut pending_oom_kills = 0_u64;
+        let mut pending_service_restarts = Vec::<ServiceRestartEvent>::new();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -108,14 +117,19 @@ impl Monitor {
             if now.duration_since(last_process).as_secs() >= process_interval {
                 last_process = now;
                 let collector = self.processes.clone();
-                let collected = tokio::task::spawn_blocking(move || {
+                let (collected, lifecycle) = tokio::task::spawn_blocking(move || {
                     collector
                         .lock()
-                        .map(|mut c| c.collect())
+                        .map(|mut c| c.collect_with_lifecycle())
                         .unwrap_or_default()
                 })
                 .await
                 .unwrap_or_default();
+                if !lifecycle.is_empty()
+                    && let Err(e) = self.store.record_process_lifecycle(&lifecycle)
+                {
+                    warn!(error=%e,"failed to persist process lifecycle events");
+                }
                 if now.duration_since(last_history).as_secs() >= 30 {
                     if let Err(e) = self.store.save_processes(epoch, &collected) {
                         warn!(error=%e,"failed to persist process sample");
@@ -133,6 +147,23 @@ impl Monitor {
             if now.duration_since(last_service).as_secs() >= config.collection.service_seconds {
                 last_service = now;
                 let services = collect_services().await;
+                match self.store.observe_service_restarts(&services, epoch) {
+                    Ok(events) => {
+                        for event in events {
+                            if let Some(existing) = pending_service_restarts
+                                .iter_mut()
+                                .find(|pending| pending.unit == event.unit)
+                            {
+                                existing.current_count = event.current_count;
+                            } else if pending_service_restarts.len() < 100 {
+                                pending_service_restarts.push(event);
+                            } else {
+                                warn!("service restart event queue reached its 100-unit cap");
+                            }
+                        }
+                    }
+                    Err(e) => warn!(error=%e,"failed to observe service restart counters"),
+                }
                 *self.live.services.write().await = services;
                 did_update = true;
             }
@@ -148,6 +179,11 @@ impl Monitor {
                     &processes,
                 );
                 snapshot.timestamp = epoch;
+                if let Some(previous) = last_oom_kill_count {
+                    pending_oom_kills = pending_oom_kills
+                        .saturating_add(snapshot.oom_kill_count.saturating_sub(previous));
+                }
+                last_oom_kill_count = Some(snapshot.oom_kill_count);
                 if let Err(e) = self.store.insert_snapshot(&snapshot) {
                     warn!(error=%e,"failed to write host sample");
                 }
@@ -161,11 +197,26 @@ impl Monitor {
                     if let Err(e) = self.store.aggregate_until(epoch) {
                         warn!(error=%e,"metric aggregation failed");
                     }
-                    match evaluator.evaluate(&self.store, &config, &snapshot, &processes, epoch) {
+                    let workload_metrics = crate::workloads::baseline_metrics(&processes);
+                    if let Err(e) = self.store.insert_named_metrics(epoch, &workload_metrics) {
+                        warn!(error=%e,"failed to persist workload metrics");
+                    }
+                    match evaluator.evaluate(
+                        &self.store,
+                        &config,
+                        &snapshot,
+                        &processes,
+                        &workload_metrics,
+                        pending_oom_kills,
+                        &pending_service_restarts,
+                        epoch,
+                    ) {
                         Ok(notices) => {
                             for notice in notices {
                                 self.notifications.notify(&config, notice).await;
                             }
+                            pending_oom_kills = 0;
+                            pending_service_restarts.clear();
                         }
                         Err(e) => warn!(error=%e,"intelligence evaluation failed"),
                     }
@@ -386,6 +437,7 @@ fn collect_host(
         swap_free_bytes: mem.swap_free,
         swap_in_bytes_per_sec: swap_in,
         swap_out_bytes_per_sec: swap_out,
+        oom_kill_count: vm.2,
         psi_cpu_some_percent: read_psi("cpu", "some"),
         psi_memory_some_percent: read_psi("memory", "some"),
         psi_memory_full_percent: read_psi("memory", "full"),
@@ -497,22 +549,24 @@ fn parse_meminfo(raw: &str) -> Memory {
     }
     m
 }
-fn read_vmstat() -> (u64, u64) {
+fn read_vmstat() -> (u64, u64, u64) {
     let raw = fs::read_to_string("/proc/vmstat").unwrap_or_default();
     parse_vmstat(&raw)
 }
-fn parse_vmstat(raw: &str) -> (u64, u64) {
+fn parse_vmstat(raw: &str) -> (u64, u64, u64) {
     let mut a = 0;
     let mut b = 0;
+    let mut oom_kill = 0;
     for l in raw.lines() {
         let mut p = l.split_whitespace();
         match p.next() {
             Some("pswpin") => a = p.next().and_then(|x| x.parse().ok()).unwrap_or(0),
             Some("pswpout") => b = p.next().and_then(|x| x.parse().ok()).unwrap_or(0),
+            Some("oom_kill") => oom_kill = p.next().and_then(|x| x.parse().ok()).unwrap_or(0),
             _ => {}
         }
     }
-    (a, b)
+    (a, b, oom_kill)
 }
 fn read_load() -> [f64; 3] {
     fs::read_to_string("/proc/loadavg")
@@ -749,12 +803,10 @@ async fn collect_service_scope(user: bool) -> Vec<ServiceSnapshot> {
     }
     command
         .args([
-            "list-units",
+            "show",
             "--type=service",
-            "--all",
-            "--no-legend",
+            "--property=Id,NRestarts,LoadState,ActiveState,SubState,Description",
             "--no-pager",
-            "--plain",
         ])
         .kill_on_drop(true);
     let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(3), command.output()).await
@@ -764,22 +816,53 @@ async fn collect_service_scope(user: bool) -> Vec<ServiceSnapshot> {
     if !output.status.success() {
         return Vec::new();
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields.len() < 4 || !fields[0].ends_with(".service") {
-                return None;
-            }
-            Some(ServiceSnapshot {
-                name: fields[0].to_string(),
-                load: fields[1].to_string(),
-                active: fields[2].to_string(),
-                sub: fields[3].to_string(),
-                description: fields.get(4..).unwrap_or_default().join(" "),
-            })
-        })
-        .collect()
+    parse_service_show(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_service_show(raw: &str) -> Vec<ServiceSnapshot> {
+    fn finish(properties: &mut HashMap<String, String>, services: &mut Vec<ServiceSnapshot>) {
+        let Some(name) = properties.remove("Id") else {
+            properties.clear();
+            return;
+        };
+        if name.ends_with(".service") {
+            services.push(ServiceSnapshot {
+                name,
+                load: properties.remove("LoadState").unwrap_or_default(),
+                active: properties.remove("ActiveState").unwrap_or_default(),
+                sub: properties.remove("SubState").unwrap_or_default(),
+                description: properties.remove("Description").unwrap_or_default(),
+                restart_count: properties
+                    .remove("NRestarts")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0),
+            });
+        }
+        properties.clear();
+    }
+
+    let mut services = Vec::new();
+    let mut properties = HashMap::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            finish(&mut properties, &mut services);
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key == "Id" && properties.contains_key("Id") {
+            finish(&mut properties, &mut services);
+        }
+        if matches!(
+            key,
+            "Id" | "NRestarts" | "LoadState" | "ActiveState" | "SubState" | "Description"
+        ) {
+            properties.insert(key.to_string(), value.to_string());
+        }
+    }
+    finish(&mut properties, &mut services);
+    services
 }
 
 #[cfg(test)]
@@ -806,6 +889,17 @@ mod tests {
     }
 
     #[test]
+    fn systemd_show_parser_reads_restart_counts() {
+        let parsed = parse_service_show(
+            "Id=worker.service\nNRestarts=3\nLoadState=loaded\nActiveState=active\nSubState=running\nDescription=Worker=primary\n\nId=not-a-service.target\nNRestarts=0\nLoadState=loaded\nActiveState=active\nSubState=active\nDescription=Target\n",
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "worker.service");
+        assert_eq!(parsed[0].restart_count, 3);
+        assert_eq!(parsed[0].description, "Worker=primary");
+    }
+
+    #[test]
     fn memory_parser_converts_kib_and_swap_counters_are_separate() {
         let mem = parse_meminfo(
             "MemTotal: 1024 kB\nMemAvailable: 768 kB\nCached: 128 kB\nBuffers: 16 kB\nSwapTotal: 512 kB\nSwapFree: 256 kB\n",
@@ -814,8 +908,8 @@ mod tests {
         assert_eq!(mem.available, 786_432);
         assert_eq!(mem.swap_total - mem.swap_free, 262_144);
         assert_eq!(
-            parse_vmstat("pswpin 12\npswpout 34\npgfault 99\n"),
-            (12, 34)
+            parse_vmstat("pswpin 12\npswpout 34\npgfault 99\noom_kill 7\n"),
+            (12, 34, 7)
         );
     }
 

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct HostSnapshot {
     pub timestamp: i64,
     pub hostname: String,
@@ -21,6 +22,7 @@ pub struct HostSnapshot {
     pub swap_free_bytes: u64,
     pub swap_in_bytes_per_sec: f64,
     pub swap_out_bytes_per_sec: f64,
+    pub oom_kill_count: u64,
     pub psi_cpu_some_percent: Option<f64>,
     pub psi_memory_some_percent: Option<f64>,
     pub psi_memory_full_percent: Option<f64>,
@@ -100,12 +102,50 @@ pub struct ProcessSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessLifecycleEvent {
+    pub timestamp: i64,
+    pub kind: String,
+    pub key: String,
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: u32,
+    pub name: String,
+    pub executable: Option<String>,
+    pub workload: String,
+    pub cpu_percent: f64,
+    pub rss_bytes: u64,
+    pub runtime_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServiceSnapshot {
     pub name: String,
     pub load: String,
     pub active: String,
     pub sub: String,
     pub description: String,
+    pub restart_count: u64,
+}
+
+impl Default for ServiceSnapshot {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            load: String::new(),
+            active: String::new(),
+            sub: String::new(),
+            description: String::new(),
+            restart_count: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRestartEvent {
+    pub unit: String,
+    pub previous_count: u64,
+    pub current_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

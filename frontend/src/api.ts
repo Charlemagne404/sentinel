@@ -1,6 +1,6 @@
 import type {
   Baseline, HostSnapshot, Incident, Overview, ProcessSnapshot, PublicConfig,
-  Series, ServiceSnapshot, Workload,
+  ProcessLifecycleEvent, Series, ServiceSnapshot, Workload,
 } from "./types";
 
 let csrfToken: string | null = null;
@@ -62,6 +62,9 @@ export const api = {
     request<{ total: number; filtered: number; processes: ProcessSnapshot[] }>(
       `/api/v1/processes?q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}&limit=1000`,
     ),
+  processLifecycle: (minutes = 1440) => request<{ minutes: number; events: ProcessLifecycleEvent[] }>(
+    `/api/v1/process-lifecycle?minutes=${minutes}&limit=100`,
+  ),
   process: (key: string) => request<{ current: ProcessSnapshot | null; history: Record<string, number | string | boolean>[] }>(
     `/api/v1/processes/${encodeURIComponent(key)}`,
   ),

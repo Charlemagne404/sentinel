@@ -1,4 +1,8 @@
-use crate::{model::ProcessSnapshot, workloads};
+use crate::{
+    model::{ProcessLifecycleEvent, ProcessSnapshot},
+    storage::unix_now,
+    workloads,
+};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -49,6 +53,7 @@ pub struct ProcessCollector {
     previous_pids: HashMap<u32, String>,
     orphaned: HashSet<String>,
     cpu: HashMap<String, (u64, Instant)>,
+    initialized: bool,
 }
 
 impl ProcessCollector {
@@ -67,19 +72,22 @@ impl ProcessCollector {
         }
     }
 
-    pub fn collect(&mut self) -> Vec<ProcessSnapshot> {
+    pub fn collect_with_lifecycle(&mut self) -> (Vec<ProcessSnapshot>, Vec<ProcessLifecycleEvent>) {
         let Ok(entries) = fs::read_dir("/proc") else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
+        let entries = entries.flatten().collect::<Vec<_>>();
+        let mut observed_pids = HashSet::new();
         let mut raw = Vec::<(ProcessSnapshot, u64)>::new();
         let now = Instant::now();
         let uptime = fs::read_to_string("/proc/uptime")
             .ok()
             .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
             .unwrap_or(0.0);
-        for entry in entries.flatten() {
+        for entry in entries {
             let pid = entry.file_name().to_string_lossy().parse::<u32>().ok();
             let Some(pid) = pid else { continue };
+            observed_pids.insert(pid);
             let dir = entry.path();
             let Ok(stat_raw) = fs::read_to_string(dir.join("stat")) else {
                 continue;
@@ -152,12 +160,22 @@ impl ProcessCollector {
             &self.previous,
             &self.previous_pids,
             &current_pid_keys,
+            &observed_pids,
             &mut self.orphaned,
         );
-        self.previous = raw
+        let current = raw
             .iter()
             .map(|(p, _)| (p.key.clone(), p.clone()))
-            .collect();
+            .collect::<HashMap<_, _>>();
+        let lifecycle = lifecycle_changes(
+            &self.previous,
+            &current,
+            &observed_pids,
+            self.initialized,
+            unix_now(),
+        );
+        self.previous = current;
+        self.initialized = true;
         self.previous_pids = current_pid_keys;
         let alive = self
             .previous
@@ -168,7 +186,62 @@ impl ProcessCollector {
         self.cpu.retain(|key, _| alive.contains(key));
         let mut processes = raw.into_iter().map(|(p, _)| p).collect::<Vec<_>>();
         processes.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
-        processes
+        (processes, lifecycle)
+    }
+}
+
+fn lifecycle_changes(
+    previous: &HashMap<String, ProcessSnapshot>,
+    current: &HashMap<String, ProcessSnapshot>,
+    observed_pids: &HashSet<u32>,
+    initialized: bool,
+    timestamp: i64,
+) -> Vec<ProcessLifecycleEvent> {
+    if !initialized {
+        return Vec::new();
+    }
+    let mut events = Vec::new();
+    for process in current.values() {
+        match previous.get(&process.key) {
+            None => events.push(lifecycle_event("started", process, timestamp)),
+            Some(old) if process.parent_disappeared && !old.parent_disappeared => {
+                events.push(lifecycle_event("parent_lost", process, timestamp));
+            }
+            _ => {}
+        }
+    }
+    for process in previous.values() {
+        if current.contains_key(&process.key) {
+            continue;
+        }
+        let pid_reused = current.values().any(|now| now.pid == process.pid);
+        if pid_reused || !observed_pids.contains(&process.pid) {
+            events.push(lifecycle_event("exited", process, timestamp));
+        }
+    }
+    events.sort_by(|a, b| {
+        b.cpu_percent
+            .total_cmp(&a.cpu_percent)
+            .then_with(|| b.rss_bytes.cmp(&a.rss_bytes))
+    });
+    events.truncate(100);
+    events
+}
+
+fn lifecycle_event(kind: &str, process: &ProcessSnapshot, timestamp: i64) -> ProcessLifecycleEvent {
+    ProcessLifecycleEvent {
+        timestamp,
+        kind: kind.into(),
+        key: process.key.clone(),
+        pid: process.pid,
+        ppid: process.ppid,
+        uid: process.uid,
+        name: process.name.clone(),
+        executable: process.executable.clone(),
+        workload: process.workload.clone(),
+        cpu_percent: process.cpu_percent,
+        rss_bytes: process.rss_bytes,
+        runtime_seconds: process.runtime_seconds,
     }
 }
 
@@ -181,6 +254,7 @@ fn mark_parent_losses(
     previous: &HashMap<String, ProcessSnapshot>,
     previous_pids: &HashMap<u32, String>,
     current_pids: &HashMap<u32, String>,
+    observed_pids: &HashSet<u32>,
     orphaned: &mut HashSet<String>,
 ) {
     for process in current {
@@ -188,7 +262,15 @@ fn mark_parent_losses(
         let parent_gone = previous
             .get(&process.key)
             .and_then(|old| previous_pids.get(&old.ppid).map(|key| (old.ppid, key)))
-            .is_some_and(|(pid, old_key)| pid > 1 && current_pids.get(&pid) != Some(old_key));
+            .is_some_and(|(pid, old_key)| {
+                if pid <= 1 {
+                    return false;
+                }
+                match current_pids.get(&pid) {
+                    Some(current_key) => current_key != old_key,
+                    None => !observed_pids.contains(&pid),
+                }
+            });
         if parent_gone {
             orphaned.insert(process.key.clone());
         }
@@ -248,6 +330,28 @@ fn read_unified_cgroup(path: &std::path::Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot(pid: u32, start_ticks: u64) -> ProcessSnapshot {
+        ProcessSnapshot {
+            key: process_key("boot", pid, start_ticks),
+            pid,
+            ppid: 1,
+            uid: 1000,
+            name: "worker".into(),
+            executable: Some("/usr/bin/worker".into()),
+            state: "S".into(),
+            start_ticks,
+            runtime_seconds: 60,
+            cpu_percent: 1.0,
+            rss_bytes: 4096,
+            virtual_bytes: 8192,
+            process_group: pid as i32,
+            session: 1,
+            cgroup: None,
+            workload: "worker.service".into(),
+            parent_disappeared: false,
+        }
+    }
     #[test]
     fn proc_stat_handles_spaces_and_parentheses_in_comm() {
         let mut fields = vec![
@@ -307,6 +411,7 @@ mod tests {
             &previous,
             &previous_pids,
             &current_pids,
+            &HashSet::from([300]),
             &mut orphaned,
         );
         assert!(first.parent_disappeared);
@@ -318,8 +423,99 @@ mod tests {
             &now_previous,
             &current_pids,
             &current_pids,
+            &HashSet::from([300]),
             &mut orphaned,
         );
         assert!(second.parent_disappeared);
+    }
+
+    #[test]
+    fn parent_loss_waits_when_parent_pid_exists_but_stat_was_unreadable() {
+        let mut child = snapshot(300, 10);
+        child.ppid = 100;
+        let previous = HashMap::from([(child.key.clone(), child.clone())]);
+        let previous_pids = HashMap::from([(100, "boot:100:4".into()), (300, child.key.clone())]);
+        let current_pids = HashMap::from([(300, child.key.clone())]);
+        let observed_pids = HashSet::from([100, 300]);
+        let mut orphaned = HashSet::new();
+        mark_parent_losses(
+            &mut [&mut child],
+            &previous,
+            &previous_pids,
+            &current_pids,
+            &observed_pids,
+            &mut orphaned,
+        );
+        assert!(!child.parent_disappeared);
+        assert!(orphaned.is_empty());
+    }
+
+    #[test]
+    fn parent_pid_reuse_counts_as_the_original_parent_disappearing() {
+        let mut child = snapshot(300, 10);
+        child.ppid = 100;
+        let previous = HashMap::from([(child.key.clone(), child.clone())]);
+        let previous_pids = HashMap::from([(100, "boot:100:4".into()), (300, child.key.clone())]);
+        let current_pids = HashMap::from([(100, "boot:100:9".into()), (300, child.key.clone())]);
+        let observed_pids = HashSet::from([100, 300]);
+        let mut orphaned = HashSet::new();
+        mark_parent_losses(
+            &mut [&mut child],
+            &previous,
+            &previous_pids,
+            &current_pids,
+            &observed_pids,
+            &mut orphaned,
+        );
+        assert!(child.parent_disappeared);
+    }
+
+    #[test]
+    fn lifecycle_diff_ignores_seed_inventory_and_records_start_exit_and_parent_loss() {
+        let first = snapshot(10, 1);
+        let first_map = HashMap::from([(first.key.clone(), first.clone())]);
+        assert!(
+            lifecycle_changes(
+                &HashMap::new(),
+                &first_map,
+                &HashSet::from([10]),
+                false,
+                100,
+            )
+            .is_empty()
+        );
+
+        let child = snapshot(11, 2);
+        let next = HashMap::from([
+            (first.key.clone(), first.clone()),
+            (child.key.clone(), child.clone()),
+        ]);
+        let started = lifecycle_changes(&first_map, &next, &HashSet::from([10, 11]), true, 110);
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].kind, "started");
+        assert_eq!(started[0].pid, 11);
+
+        let ended = lifecycle_changes(
+            &next,
+            &HashMap::from([(child.key.clone(), child.clone())]),
+            &HashSet::from([11]),
+            true,
+            120,
+        );
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].kind, "exited");
+        assert_eq!(ended[0].pid, 10);
+
+        let mut orphan = child.clone();
+        orphan.parent_disappeared = true;
+        let parent_lost = lifecycle_changes(
+            &HashMap::from([(child.key.clone(), child)]),
+            &HashMap::from([(orphan.key.clone(), orphan)]),
+            &HashSet::from([11]),
+            true,
+            130,
+        );
+        assert_eq!(parent_lost.len(), 1);
+        assert_eq!(parent_lost[0].kind, "parent_lost");
     }
 }

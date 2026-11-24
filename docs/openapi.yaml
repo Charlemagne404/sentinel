@@ -82,7 +82,7 @@ paths:
         "401": { description: Authentication required }
   /overview:
     get:
-      summary: Current host, workloads, processes, incidents, and service summary
+      summary: Current host, workloads, processes, incidents, and service summary, including the kernel OOM counter
       responses:
         "200": { description: Current overview snapshot }
   /events:
@@ -123,6 +123,18 @@ paths:
           schema: { type: integer, minimum: 1, maximum: 1000, default: 500 }
       responses:
         "200": { description: Process inventory }
+  /process-lifecycle:
+    get:
+      summary: Recent process starts, exits, and observed parent losses
+      parameters:
+        - in: query
+          name: minutes
+          schema: { type: integer, minimum: 1, maximum: 10080, default: 1440 }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 250 }
+      responses:
+        "200": { description: Bounded sampled lifecycle events with last-known process identity and resource data }
   /processes/{key}:
     get:
       summary: Current process record and sampled history
@@ -223,7 +235,7 @@ paths:
         "200": { description: New baseline version and reset timestamp }
   /services:
     get:
-      summary: Read-only system and user service inventory
+      summary: Read-only system and user service inventory with systemd restart counters
       responses:
         "200": { description: Service rows and availability }
   /config:

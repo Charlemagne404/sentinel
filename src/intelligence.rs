@@ -1,6 +1,6 @@
 use crate::{
     config::Config,
-    model::{HostSnapshot, ProcessSnapshot},
+    model::{HostSnapshot, ProcessSnapshot, ServiceRestartEvent},
     notifications::IncidentNotice,
     storage::{Baseline, Store},
 };
@@ -29,11 +29,15 @@ impl Evaluator {
         config: &Config,
         host: &HostSnapshot,
         processes: &[ProcessSnapshot],
+        workload_metrics: &[(String, f64)],
+        oom_kill_delta: u64,
+        service_restarts: &[ServiceRestartEvent],
         now: i64,
     ) -> anyhow::Result<Vec<IncidentNotice>> {
         let mut notices = Vec::new();
         let mut triggers = Vec::<Trigger>::new();
-        let metrics = host.metrics();
+        let mut metrics = host.metrics();
+        metrics.extend_from_slice(workload_metrics);
         let (baseline_version, reset_at) = store.baseline_state()?;
         let current_baselines = store
             .baselines()?
@@ -132,7 +136,7 @@ impl Evaluator {
             triggers.push(trigger("swap_activity",swap_rate,5.0,"warning","Swap is actively moving more than 5 MiB/s; occupied swap alone is not treated as an incident.","resource"));
         }
 
-        let active_before = store.incidents(true, 500)?.len() > 0;
+        let active_incidents = store.incidents(true, 500)?;
         let adaptive_hold = available_pct < 10.0
             || host.psi_cpu_some_percent.is_some_and(|value| value > 50.0)
             || host
@@ -142,7 +146,6 @@ impl Evaluator {
                 .cpu_temperature_c
                 .zip(host.cpu_temperature_limit_c)
                 .is_some_and(|(temperature, limit)| limit > 0.0 && temperature >= limit * 0.95);
-        let training_frozen = active_before || !triggers.is_empty() || adaptive_hold;
         for (metric, value) in metrics {
             let since = (now - 7 * 86400).max(reset_at);
             let values = store.baseline_values(&metric, since, 10_080)?;
@@ -184,7 +187,15 @@ impl Evaluator {
                     "statistical",
                 ));
             }
-            if !training_frozen {
+            let metric_frozen = adaptive_hold
+                || oom_kill_delta > 0
+                || is_candidate
+                || triggers.iter().any(|t| t.metric == metric)
+                || active_incidents
+                    .iter()
+                    .any(|incident| incident_affects_metric(incident, &metric))
+                || (!service_restarts.is_empty() && metric.starts_with("workload::"));
+            if !metric_frozen {
                 let baseline = Baseline {
                     metric: metric.clone(),
                     version: baseline_version,
@@ -240,6 +251,88 @@ impl Evaluator {
         }
 
         let mut observed = HashSet::<String>::new();
+        if oom_kill_delta > 0 {
+            let signature = "oom-kill";
+            let evidence = serde_json::json!({
+                "events_since_last_evaluation": oom_kill_delta,
+                "kernel_oom_kill_counter": host.oom_kill_count,
+                "source": "/proc/vmstat oom_kill",
+                "attribution": "The kernel counter is host-wide; it does not identify the killed process."
+            });
+            let explanation = format!(
+                "The kernel OOM-kill counter increased by {oom_kill_delta} since Sentinel's previous observation. This is a direct host-wide counter; it does not identify which process was killed."
+            );
+            let (id, created) = store.open_or_update_incident(
+                signature,
+                "critical",
+                "The kernel killed a process under memory pressure",
+                0.98,
+                &evidence,
+                &explanation,
+                now,
+            )?;
+            if created {
+                notices.push(IncidentNotice {
+                    incident_id: Some(id),
+                    signature: signature.into(),
+                    severity: "critical".into(),
+                    title: "The kernel killed a process under memory pressure".into(),
+                    recovered: false,
+                });
+            }
+            store.append_anomaly(
+                now,
+                "oom_kill_events",
+                oom_kill_delta as f64,
+                10.0,
+                &format!("/proc/vmstat oom_kill increased by {oom_kill_delta}"),
+                Some(id),
+            )?;
+            observed.insert(signature.into());
+        }
+        for event in service_restarts.iter().take(100) {
+            let signature = format!("service-restart:{}", event.unit);
+            let delta = event.current_count.saturating_sub(event.previous_count);
+            let evidence = serde_json::json!({
+                "unit": event.unit,
+                "previous_restart_count": event.previous_count,
+                "current_restart_count": event.current_count,
+                "observed_increase": delta,
+                "source": "systemd NRestarts"
+            });
+            let title = format!("Service restart observed: {}", event.unit);
+            let explanation = format!(
+                "systemd's NRestarts counter for {} increased from {} to {} between Sentinel service inventory samples. Sentinel observes this counter; it does not restart or modify the unit.",
+                event.unit, event.previous_count, event.current_count
+            );
+            let (id, created) = store.open_or_update_incident(
+                &signature,
+                "warning",
+                &title,
+                0.95,
+                &evidence,
+                &explanation,
+                now,
+            )?;
+            if created {
+                notices.push(IncidentNotice {
+                    incident_id: Some(id),
+                    signature: signature.clone(),
+                    severity: "warning".into(),
+                    title,
+                    recovered: false,
+                });
+            }
+            store.append_anomaly(
+                now,
+                "service_restart_events",
+                delta as f64,
+                5.0,
+                &format!("{} NRestarts increased by {delta}", event.unit),
+                Some(id),
+            )?;
+            observed.insert(signature);
+        }
         let resource = triggers
             .iter()
             .filter(|t| t.kind == "resource")
@@ -362,6 +455,28 @@ fn is_browser(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.contains("chrom") || n.contains("firefox") || n.contains("browser")
 }
+fn incident_affects_metric(incident: &crate::model::Incident, metric: &str) -> bool {
+    match incident.signature.as_str() {
+        "resource-pressure" => {
+            incident.evidence["observations"]
+                .as_array()
+                .is_some_and(|observations| {
+                    observations
+                        .iter()
+                        .any(|observation| observation["metric"].as_str() == Some(metric))
+                })
+        }
+        "thermal" => metric == "cpu_temperature_c",
+        "storage" => metric == "disk_used_percent",
+        "oom-kill" => true,
+        "orphan-browser" => metric.starts_with("workload::"),
+        signature if signature.starts_with("stat:") => {
+            signature.strip_prefix("stat:") == Some(metric)
+        }
+        signature if signature.starts_with("service-restart:") => metric.starts_with("workload::"),
+        _ => false,
+    }
+}
 fn median(values: &[f64]) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -467,7 +582,7 @@ mod tests {
         };
         let now = crate::storage::unix_now();
         let opened = evaluator
-            .evaluate(&store, &config, &host, &[], now)
+            .evaluate(&store, &config, &host, &[], &[], 0, &[], now)
             .unwrap();
         assert_eq!(opened.len(), 1);
         assert_eq!(store.incidents(true, 10).unwrap()[0].severity, "critical");
@@ -476,21 +591,109 @@ mod tests {
         host.memory_used_bytes = 200;
         assert!(
             evaluator
-                .evaluate(&store, &config, &host, &[], now + 60)
+                .evaluate(&store, &config, &host, &[], &[], 0, &[], now + 60)
                 .unwrap()
                 .is_empty()
         );
         assert!(
             evaluator
-                .evaluate(&store, &config, &host, &[], now + 120)
+                .evaluate(&store, &config, &host, &[], &[], 0, &[], now + 120)
                 .unwrap()
                 .is_empty()
         );
         let recovered = evaluator
-            .evaluate(&store, &config, &host, &[], now + 180)
+            .evaluate(&store, &config, &host, &[], &[], 0, &[], now + 180)
             .unwrap();
         assert_eq!(recovered.len(), 1);
         assert!(recovered[0].recovered);
         assert!(store.incidents(true, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn synthetic_oom_and_service_restart_evidence_opens_and_recovers_incidents() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("synthetic.sqlite")).unwrap();
+        let config = Config::default();
+        let mut evaluator = Evaluator::default();
+        let host = HostSnapshot {
+            oom_kill_count: 8,
+            ..HostSnapshot::default()
+        };
+        let restart = ServiceRestartEvent {
+            unit: "example-worker.service".into(),
+            previous_count: 1,
+            current_count: 3,
+        };
+        let now = crate::storage::unix_now();
+        let opened = evaluator
+            .evaluate(&store, &config, &host, &[], &[], 2, &[restart], now)
+            .unwrap();
+        assert_eq!(opened.len(), 2);
+        let active = store.incidents(true, 10).unwrap();
+        assert_eq!(active.len(), 2);
+        assert!(
+            active
+                .iter()
+                .any(|incident| incident.signature == "oom-kill")
+        );
+        assert!(
+            active
+                .iter()
+                .any(|incident| incident.signature == "service-restart:example-worker.service")
+        );
+        assert_eq!(store.anomalies(now - 1, 10).unwrap().len(), 2);
+
+        for offset in [60, 120] {
+            assert!(
+                evaluator
+                    .evaluate(&store, &config, &host, &[], &[], 0, &[], now + offset)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let recovered = evaluator
+            .evaluate(&store, &config, &host, &[], &[], 0, &[], now + 180)
+            .unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered.iter().all(|notice| notice.recovered));
+        assert!(store.incidents(true, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn persistent_storage_warning_freezes_only_its_related_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("selective-freeze.sqlite")).unwrap();
+        let config = Config::default();
+        let mut evaluator = Evaluator::default();
+        let now = crate::storage::unix_now();
+        let mut host = HostSnapshot {
+            disk_total_bytes: 1000,
+            disk_available_bytes: 10,
+            ..HostSnapshot::default()
+        };
+        evaluator
+            .evaluate(&store, &config, &host, &[], &[], 0, &[], now)
+            .unwrap();
+        let metrics = store
+            .baselines()
+            .unwrap()
+            .into_iter()
+            .map(|baseline| baseline.metric)
+            .collect::<HashSet<_>>();
+        assert!(metrics.contains("cpu"));
+        assert!(!metrics.contains("disk_used_percent"));
+
+        host.disk_available_bytes = 900;
+        evaluator
+            .evaluate(&store, &config, &host, &[], &[], 0, &[], now + 60)
+            .unwrap();
+        let metrics = store
+            .baselines()
+            .unwrap()
+            .into_iter()
+            .map(|baseline| baseline.metric)
+            .collect::<HashSet<_>>();
+        assert!(metrics.contains("cpu"));
+        assert!(!metrics.contains("disk_used_percent"));
     }
 }

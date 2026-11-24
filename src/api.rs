@@ -74,6 +74,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/events", get(events))
         .route("/api/v1/metrics/{name}", get(metric_history))
         .route("/api/v1/processes", get(processes))
+        .route("/api/v1/process-lifecycle", get(process_lifecycle))
         .route("/api/v1/processes/{key}", get(process_detail))
         .route("/api/v1/workloads", get(workloads))
         .route(
@@ -466,6 +467,8 @@ fn metric_unit(metric: &str) -> &'static str {
         | "swap_in_bytes_per_sec"
         | "swap_out_bytes_per_sec" => "bytes/s",
         "disk_read_iops" | "disk_write_iops" => "IOPS",
+        m if m.starts_with("workload::") && m.ends_with("::cpu_percent") => "%",
+        m if m.starts_with("workload::") && m.ends_with("::rss_bytes") => "bytes",
         _ => "value",
     }
 }
@@ -475,6 +478,24 @@ struct ProcessQuery {
     sort: Option<String>,
     limit: Option<usize>,
 }
+#[derive(Deserialize)]
+struct ProcessLifecycleQuery {
+    minutes: Option<u32>,
+    limit: Option<usize>,
+}
+
+async fn process_lifecycle(
+    State(s): State<AppState>,
+    Query(q): Query<ProcessLifecycleQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let minutes = q.minutes.unwrap_or(1440).clamp(1, 7 * 24 * 60);
+    let events = s
+        .store
+        .process_lifecycle(unix_now() - minutes as i64 * 60, q.limit.unwrap_or(250))
+        .map_err(ApiError::internal)?;
+    Ok(Json(serde_json::json!({"minutes":minutes,"events":events})))
+}
+
 async fn processes(
     State(s): State<AppState>,
     Query(q): Query<ProcessQuery>,

@@ -1,4 +1,7 @@
-use crate::model::{HostSnapshot, Incident, ProcessSnapshot};
+use crate::model::{
+    HostSnapshot, Incident, ProcessLifecycleEvent, ProcessSnapshot, ServiceRestartEvent,
+    ServiceSnapshot,
+};
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, backup::Backup, params};
 use std::{
@@ -81,6 +84,8 @@ impl Store {
             CREATE INDEX IF NOT EXISTS quarter_points_lookup ON quarter_points(name,ts);
             CREATE TABLE IF NOT EXISTS process_samples(ts INTEGER NOT NULL, proc_key TEXT NOT NULL, pid INTEGER NOT NULL, ppid INTEGER NOT NULL, uid INTEGER NOT NULL, name TEXT NOT NULL, executable TEXT, state TEXT NOT NULL, start_ticks INTEGER NOT NULL, runtime_seconds INTEGER NOT NULL, cpu_percent REAL NOT NULL, rss_bytes INTEGER NOT NULL, virtual_bytes INTEGER NOT NULL, process_group INTEGER NOT NULL, session INTEGER NOT NULL, cgroup TEXT, workload TEXT NOT NULL, parent_disappeared INTEGER NOT NULL, PRIMARY KEY(ts,proc_key)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS process_samples_key ON process_samples(proc_key,ts);
+            CREATE TABLE IF NOT EXISTS process_lifecycle_events(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, kind TEXT NOT NULL, proc_key TEXT NOT NULL, pid INTEGER NOT NULL, ppid INTEGER NOT NULL, uid INTEGER NOT NULL, name TEXT NOT NULL, executable TEXT, workload TEXT NOT NULL, cpu_percent REAL NOT NULL, rss_bytes INTEGER NOT NULL, runtime_seconds INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS process_lifecycle_events_ts ON process_lifecycle_events(ts DESC,id DESC);
             CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY, signature TEXT NOT NULL, severity TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, recovered_at INTEGER, confidence REAL NOT NULL, evidence TEXT NOT NULL, explanation TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS incidents_status_last ON incidents(status,last_seen DESC);
             CREATE UNIQUE INDEX IF NOT EXISTS active_incident_signature ON incidents(signature) WHERE status='active';
@@ -94,6 +99,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, csrf TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS bootstrap_tokens(token_hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS workload_labels(workload TEXT PRIMARY KEY, display_name TEXT NOT NULL, labels_json TEXT NOT NULL DEFAULT '[]', updated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS service_restart_state(unit TEXT PRIMARY KEY, restart_count INTEGER NOT NULL, updated_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS notification_history(id INTEGER PRIMARY KEY, incident_id INTEGER, signature TEXT NOT NULL DEFAULT '', ts INTEGER NOT NULL, provider TEXT NOT NULL, status TEXT NOT NULL, detail TEXT);
             INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,unixepoch());
             COMMIT;")?;
@@ -120,7 +126,7 @@ impl Store {
             )?;
         }
         conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,unixepoch()),(3,unixepoch())",
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,unixepoch()),(3,unixepoch()),(4,unixepoch()),(5,unixepoch())",
             [],
         )?;
         Ok(Self {
@@ -159,6 +165,77 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn insert_named_metrics(
+        &self,
+        timestamp: i64,
+        metrics: &[(String, f64)],
+    ) -> anyhow::Result<()> {
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        let mut statement = tx.prepare_cached(
+            "INSERT OR REPLACE INTO metric_points(ts,name,value) VALUES(?1,?2,?3)",
+        )?;
+        for (name, value) in metrics {
+            if known_metric(name) && value.is_finite() {
+                statement.execute(params![timestamp, name, value])?;
+            }
+        }
+        drop(statement);
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn record_process_lifecycle(&self, events: &[ProcessLifecycleEvent]) -> anyhow::Result<()> {
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        let mut statement = tx.prepare_cached("INSERT INTO process_lifecycle_events(ts,kind,proc_key,pid,ppid,uid,name,executable,workload,cpu_percent,rss_bytes,runtime_seconds) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")?;
+        for event in events.iter().take(100) {
+            statement.execute(params![
+                event.timestamp,
+                event.kind,
+                event.key,
+                event.pid as i64,
+                event.ppid as i64,
+                event.uid as i64,
+                event.name,
+                event.executable,
+                event.workload,
+                event.cpu_percent,
+                to_sql_i64(event.rss_bytes),
+                to_sql_i64(event.runtime_seconds),
+            ])?;
+        }
+        drop(statement);
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn process_lifecycle(
+        &self,
+        since: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ProcessLifecycleEvent>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare("SELECT ts,kind,proc_key,pid,ppid,uid,name,executable,workload,cpu_percent,rss_bytes,runtime_seconds FROM process_lifecycle_events WHERE ts>=? ORDER BY ts DESC,id DESC LIMIT ?")?;
+        let rows = statement.query_map(params![since, limit.clamp(1, 1000) as i64], |row| {
+            Ok(ProcessLifecycleEvent {
+                timestamp: row.get(0)?,
+                kind: row.get(1)?,
+                key: row.get(2)?,
+                pid: row.get::<_, i64>(3)?.max(0) as u32,
+                ppid: row.get::<_, i64>(4)?.max(0) as u32,
+                uid: row.get::<_, i64>(5)?.max(0) as u32,
+                name: row.get(6)?,
+                executable: row.get(7)?,
+                workload: row.get(8)?,
+                cpu_percent: row.get(9)?,
+                rss_bytes: row.get::<_, i64>(10)?.max(0) as u64,
+                runtime_seconds: row.get::<_, i64>(11)?.max(0) as u64,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn save_processes(&self, ts: i64, processes: &[ProcessSnapshot]) -> anyhow::Result<()> {
@@ -202,6 +279,41 @@ impl Store {
         drop(stmt);
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn observe_service_restarts(
+        &self,
+        services: &[ServiceSnapshot],
+        now: i64,
+    ) -> anyhow::Result<Vec<ServiceRestartEvent>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut events = Vec::new();
+        for service in services.iter().take(500) {
+            let previous: Option<i64> = tx
+                .query_row(
+                    "SELECT restart_count FROM service_restart_state WHERE unit=?1",
+                    [service.name.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let current = service.restart_count.min(i64::MAX as u64) as i64;
+            if let Some(previous) = previous {
+                if current > previous {
+                    events.push(ServiceRestartEvent {
+                        unit: service.name.clone(),
+                        previous_count: previous.max(0) as u64,
+                        current_count: current as u64,
+                    });
+                }
+            }
+            tx.execute(
+                "INSERT INTO service_restart_state(unit,restart_count,updated_at) VALUES(?1,?2,?3) ON CONFLICT(unit) DO UPDATE SET restart_count=excluded.restart_count,updated_at=excluded.updated_at",
+                params![service.name, current, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(events)
     }
 
     pub fn latest_snapshot(&self) -> anyhow::Result<Option<HostSnapshot>> {
@@ -536,6 +648,10 @@ impl Store {
             "DELETE FROM process_samples WHERE ts<?",
             [now - (raw_hours as i64 * 3600)],
         )?;
+        tx.execute(
+            "DELETE FROM process_lifecycle_events WHERE ts<?",
+            [now - 7 * 86400],
+        )?;
         tx.execute("DELETE FROM minute_points WHERE ts<?", [now - 30 * 86400])?;
         tx.execute("DELETE FROM quarter_points WHERE ts<?", [now - 365 * 86400])?;
         tx.execute(
@@ -548,12 +664,20 @@ impl Store {
             "DELETE FROM notification_history WHERE ts<?",
             [now - 365 * 86400],
         )?;
+        tx.execute(
+            "DELETE FROM baselines WHERE metric LIKE 'workload::%' AND updated_at<?",
+            [now - 30 * 86400],
+        )?;
         tx.execute("DELETE FROM sessions WHERE expires_at<?", [now])?;
         tx.commit()?;
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
         let mut bytes = self.database_size_bytes();
         let budget = budget_mb * 1024 * 1024;
         if bytes > budget {
+            conn.execute(
+                "DELETE FROM process_lifecycle_events WHERE ts<?",
+                [now - 86400],
+            )?;
             conn.execute(
                 "DELETE FROM process_samples WHERE ts<?",
                 [now - (raw_hours.min(12) as i64 * 3600)],
@@ -592,6 +716,7 @@ impl Store {
             "host_samples" => "SELECT count(*) FROM host_samples",
             "incidents" => "SELECT count(*) FROM incidents",
             "process_samples" => "SELECT count(*) FROM process_samples",
+            "process_lifecycle_events" => "SELECT count(*) FROM process_lifecycle_events",
             _ => anyhow::bail!("unsupported table"),
         };
         Ok(self.lock()?.query_row(sql, [], |r| r.get(0))?)
@@ -936,6 +1061,40 @@ fn known_metric(name: &str) -> bool {
     ) || name
         .strip_prefix("cpu_core_")
         .is_some_and(|index| index.parse::<usize>().is_ok_and(|n| n < 256))
+        || known_workload_metric(name)
+}
+
+fn known_workload_metric(name: &str) -> bool {
+    let Some(encoded) = name.strip_prefix("workload::") else {
+        return false;
+    };
+    let Some((key, suffix)) = encoded.rsplit_once("::") else {
+        return false;
+    };
+    if !matches!(suffix, "cpu_percent" | "rss_bytes") || key.len() > 320 {
+        return false;
+    }
+    let Some((label, hash)) = key.rsplit_once('~') else {
+        return false;
+    };
+    if label.is_empty() || hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    let bytes = label.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit() =>
+            {
+                i += 3;
+            }
+            b if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') => i += 1,
+            _ => return false,
+        }
+    }
+    true
 }
 pub fn unix_now() -> i64 {
     std::time::SystemTime::now()
@@ -1077,6 +1236,104 @@ mod tests {
             vec![[h.timestamp as f64, 12.0]]
         );
     }
+
+    #[test]
+    fn named_workload_metrics_are_aggregated_and_baseline_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("workload.sqlite")).unwrap();
+        let metric = "workload::echo%20archives.service~0123456789abcdef::cpu_percent";
+        let minute = unix_now().div_euclid(60) * 60;
+        store
+            .insert_named_metrics(minute - 30, &[(metric.into(), 12.5)])
+            .unwrap();
+        store.aggregate_until(minute).unwrap();
+        assert_eq!(
+            store.baseline_values(metric, minute - 60, 100).unwrap(),
+            vec![12.5]
+        );
+        assert_eq!(store.chart(metric, minute - 60, 100).unwrap()[0][1], 12.5);
+        assert!(
+            store
+                .chart(
+                    "workload::bad%Q0~0123456789abcdef::cpu_percent",
+                    minute - 60,
+                    100
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn process_lifecycle_events_are_persisted_and_returned_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("lifecycle.sqlite")).unwrap();
+        let make_event = |timestamp, kind: &str, pid| ProcessLifecycleEvent {
+            timestamp,
+            kind: kind.into(),
+            key: format!("boot:{pid}:10"),
+            pid,
+            ppid: 1,
+            uid: 1000,
+            name: "worker".into(),
+            executable: Some("/usr/bin/worker".into()),
+            workload: "worker.service".into(),
+            cpu_percent: 2.5,
+            rss_bytes: 4096,
+            runtime_seconds: 60,
+        };
+        store
+            .record_process_lifecycle(&[
+                make_event(100, "started", 10),
+                make_event(110, "exited", 10),
+            ])
+            .unwrap();
+        let rows = store.process_lifecycle(0, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].timestamp, 110);
+        assert_eq!(rows[0].kind, "exited");
+        assert_eq!(rows[1].kind, "started");
+        assert_eq!(store.count("process_lifecycle_events").unwrap(), 2);
+    }
+
+    #[test]
+    fn service_restart_observer_detects_only_increasing_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("test.sqlite")).unwrap();
+        let service = |restart_count| ServiceSnapshot {
+            name: "worker.service".into(),
+            restart_count,
+            ..ServiceSnapshot::default()
+        };
+        assert!(
+            store
+                .observe_service_restarts(&[service(2)], 100)
+                .unwrap()
+                .is_empty()
+        );
+        let events = store.observe_service_restarts(&[service(5)], 160).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].unit, "worker.service");
+        assert_eq!(events[0].previous_count, 2);
+        assert_eq!(events[0].current_count, 5);
+        assert!(
+            store
+                .observe_service_restarts(&[service(5)], 220)
+                .unwrap()
+                .is_empty()
+        );
+        // A systemd manager reset re-baselines the counter without inventing an event.
+        assert!(
+            store
+                .observe_service_restarts(&[service(1)], 280)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.observe_service_restarts(&[service(2)], 340).unwrap()[0].previous_count,
+            1
+        );
+    }
+
     #[test]
     fn incidents_deduplicate_and_recover() {
         let dir = tempfile::tempdir().unwrap();
