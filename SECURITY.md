@@ -2,7 +2,7 @@
 
 ## Network and transport
 
-The server selects an address from the configured tailscale* interface (default tailscale0) and falls back to loopback only. It does not bind wildcard addresses or alter firewall/Headscale policy. Application login is still required. Sentinel currently serves HTTP, so remote sessions rely on the encrypted Tailnet/WireGuard path. Do not expose the port through a public reverse proxy or port forward. TLS certificates are not supported.
+The server selects an address from the configured tailscale* interface (default tailscale0) and falls back to loopback only. The user unit allows AF_NETLINK for Linux interface discovery and otherwise limits socket families to Unix, IPv4, and IPv6. It does not bind wildcard addresses or alter firewall/Headscale policy. Application login is still required. Sentinel currently serves HTTP, so remote sessions rely on the encrypted Tailnet/WireGuard path. Do not expose the port through a public reverse proxy or port forward. TLS certificates are not supported.
 
 ## Authentication controls
 

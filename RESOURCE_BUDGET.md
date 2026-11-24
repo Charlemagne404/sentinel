@@ -2,7 +2,7 @@
 
 ## Configured starting limits
 
-The generated user systemd unit sets Nice=10, CPUWeight=20, CPUQuota=20%, MemoryHigh=128M, MemoryMax=192M, TasksMax=32, and IOWeight=20. It also uses NoNewPrivileges, PrivateTmp, ProtectSystem=strict, read-only home protection, kernel-tunables and control-group protection, with write paths limited to Sentinel config/data. ProtectKernelModules is omitted because this host's unprivileged user manager cannot enforce it (a transient unit probe exits with 218/CAPABILITIES). These are guardrails, not measurements of actual idle use.
+The generated user systemd unit sets Nice=10, CPUWeight=20, CPUQuota=20%, MemoryHigh=128M, MemoryMax=192M, TasksMax=32, and requests IOWeight=20. On this host the user service cgroup exposes only cpu, memory, and pids controllers, so IOWeight is not enforced without changing system-wide delegation. The unit also uses NoNewPrivileges, PrivateTmp, ProtectSystem=strict, read-only home protection, kernel-tunables and control-group protection, with write paths limited to Sentinel config/data. ProtectKernelModules is omitted because this host's unprivileged user manager cannot enforce it (a transient unit probe exits with 218/CAPABILITIES). These are guardrails, not measurements of actual idle use.
 
 ## Collection work
 
