@@ -131,7 +131,6 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=$CONFIG_DIR $DATA_DIR
 ProtectKernelTunables=true
-ProtectKernelModules=true
 ProtectControlGroups=true
 LockPersonality=true
 RestrictSUIDSGID=true
